@@ -50,7 +50,7 @@ pygame.mixer.init()
 
 # --- CONFIG ---
 WAKE_WORD_PATH = "Hey-Arthur_en_windows_v3_0_0.ppn"
-ACCESS_KEY = "fOgE55lV/RWtmBsA6qEeG+yTkvwC/ZNVA560g7DSSJO2jpb9CLbFhQ=="
+ACCESS_KEY = os.getenv("PORCUPINE_ACCESS_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # --- MODE SETTINGS ---
