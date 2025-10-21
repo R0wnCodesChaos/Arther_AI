@@ -9,7 +9,8 @@ from pathlib import Path
 import tempfile
 import threading
 from typing import Optional
-import pygame  # Better audio playback for Windows
+import pygame
+import time
 
 # TTS Options - choose one by setting USE_TTS to the option number
 USE_TTS = 1  # 1=gTTS (Google) - RECOMMENDED, 2=pyttsx3 (offline), 3=Edge-TTS (may not work), 4=OpenAI TTS
@@ -49,13 +50,19 @@ elif USE_TTS == 4:
 pygame.mixer.init()
 
 # --- CONFIG ---
-WAKE_WORD_PATH = "Hey-Arthur_en_windows_v3_0_0.ppn"
+# Use built-in wake word instead of custom file
+USE_CUSTOM_WAKE_WORD = True  # Set to False to use built-in keywords
+WAKE_WORD_PATH = "Hey-Arthur_en_windows_v3_0_0.ppn"  # Only used if USE_CUSTOM_WAKE_WORD = True
+BUILT_IN_WAKE_WORD = "jarvis"  # Options: jarvis, alexa, computer, hey google, hey siri, ok google, picovoice, porcupine, bumblebee, terminator
 ACCESS_KEY = os.getenv("PORCUPINE_ACCESS_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# Microphone selection - CHANGE THIS NUMBER TO USE A DIFFERENT MIC
+MICROPHONE_INDEX = 1  # None = default, or set to 0, 1, 2, etc. for specific device
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 # --- MODE SETTINGS ---
-# Set to True for detailed debug info, False for clean chat experience
-TEST_MODE = False  # Change to True to see all the technical details
+TEST_MODE = True  # Change to True to see all the technical details
 
 # Audio recording settings
 RECORD_SECONDS = 5
@@ -67,30 +74,25 @@ conversation_history = []
 MAX_HISTORY = 10
 
 # --- CUSTOM RESPONSES ---
-# Add your own trigger phrases and responses here
-# Format: "trigger phrase": "response"
-# Keep triggers simple without punctuation for best matching
 CUSTOM_RESPONSES = {
     "brother iq": "Your brother's IQ is lower than a rock. Just kidding!",
     "brothers iq": "Your brother's IQ is lower than a rock. Just kidding!",
-    # Add more custom responses below:
-    # "trigger": "response",
 }
 
-# Special commands that don't need custom responses (handled separately)
 SPECIAL_COMMANDS = ["activate test mode", "deactivate test mode", "enable test mode", "disable test mode"]
 
-# Thread-safe lock for conversation history
+# Thread-safe locks
 history_lock = threading.Lock()
+interrupt_lock = threading.Lock()
 
 # Track which TTS is currently working
 current_tts = USE_TTS
 tts_failed = {1: False, 2: False, 3: False, 4: False}
 
-# Flag to interrupt speech
-interrupt_speech = False
+# FIXED: Better interrupt handling with event
+interrupt_event = threading.Event()
 is_speaking = False
-wake_word_detected = False
+wake_word_queue = []  # Queue to handle wake words during speech
 
 # Initialize OpenAI client
 client = None
@@ -107,11 +109,27 @@ if TEST_MODE:
     print("🔧 Initializing Arthur...")
 
 try:
-    porcupine = pvporcupine.create(access_key=ACCESS_KEY, keyword_paths=[WAKE_WORD_PATH])
+    if USE_CUSTOM_WAKE_WORD:
+        # Use custom wake word file
+        if not os.path.exists(WAKE_WORD_PATH):
+            print(f"❌ Wake word file not found: {WAKE_WORD_PATH}")
+            print("   Place your .ppn file in the same folder as this script")
+            exit(1)
+        porcupine = pvporcupine.create(access_key=ACCESS_KEY, keyword_paths=[WAKE_WORD_PATH])
+        print(f"✅ Using custom wake word from: {WAKE_WORD_PATH}")
+    else:
+        # Use built-in wake word
+        porcupine = pvporcupine.create(access_key=ACCESS_KEY, keywords=[BUILT_IN_WAKE_WORD])
+        print(f"✅ Using built-in wake word: '{BUILT_IN_WAKE_WORD}'")
+    
     if TEST_MODE:
         print("✅ Wake word detection ready")
 except Exception as e:
     print(f"❌ Failed to initialize Porcupine: {e}")
+    print("\n🔧 Troubleshooting:")
+    print("   1. Get a FREE access key from: https://console.picovoice.ai/")
+    print("   2. Replace ACCESS_KEY in the code with your new key")
+    print("   3. Make sure you're using a valid built-in wake word")
     exit(1)
 
 pa = pyaudio.PyAudio()
@@ -119,11 +137,8 @@ pa = pyaudio.PyAudio()
 # Initialize TTS based on selected option
 if USE_TTS == 2:  # pyttsx3
     def init_tts_engine():
-        """Initialize or reinitialize the TTS engine"""
         eng = pyttsx3.init()
-        
         voices = eng.getProperty('voices')
-        
         PREFERRED_VOICE_INDEX = 0
         VOICE_RATE = 160
         VOICE_VOLUME = 1.0
@@ -143,24 +158,20 @@ if USE_TTS == 2:  # pyttsx3
                     selected_voice = voices[0].id
             
             eng.setProperty('voice', selected_voice)
-            
         except Exception as e:
             print(f"⚠️ Could not set voice: {e}")
         
         eng.setProperty('rate', VOICE_RATE)
         eng.setProperty('volume', VOICE_VOLUME)
-        
         return eng, voices, VOICE_RATE, VOICE_VOLUME
 
     engine, voices, VOICE_RATE, VOICE_VOLUME = init_tts_engine()
 
-    # Configure TTS voice for Arthur
     print("\n📢 Available voices:")
     for idx, voice in enumerate(voices):
         name = voice.name
         gender = "♂" if any(n in name.lower() for n in ["david", "mark", "george"]) else "♀"
         print(f"   [{idx}] {gender} {name}")
-
     print(f"\n🎙️ Voice configured: Rate={VOICE_RATE}, Volume={int(VOICE_VOLUME*100)}%")
 else:
     if TEST_MODE:
@@ -173,15 +184,26 @@ if TEST_MODE:
     print("✅ Whisper ready")
 
 # --- AUDIO SETUP ---
+# Set to None for default mic, or specific number (0, 1, 2, etc.) for a specific device
+MICROPHONE_INDEX = None  # Change this if you need a specific microphone
+
 stream = None
 try:
+    # Show which microphone is being used
+    if MICROPHONE_INDEX is None:
+        default_device = pa.get_default_input_device_info()
+        print(f"🎤 Using default microphone: {default_device['name']}")
+    else:
+        device_info = pa.get_device_info_by_index(MICROPHONE_INDEX)
+        print(f"🎤 Using microphone [{MICROPHONE_INDEX}]: {device_info['name']}")
+    
     stream = pa.open(
         rate=porcupine.sample_rate,
         channels=1,
         format=pyaudio.paInt16,
         input=True,
         frames_per_buffer=porcupine.frame_length,
-        input_device_index=1
+        input_device_index=MICROPHONE_INDEX
     )
     if TEST_MODE:
         print("✅ Microphone stream active")
@@ -191,19 +213,20 @@ except Exception as e:
     porcupine.delete()
     exit(1)
 
-# Create a lock for the audio stream
 stream_lock = threading.Lock()
 
 if TEST_MODE:
-    print("\n🎙️ Say 'Hey Arthur' to wake me up...")
+    wake_phrase = "Hey Arthur" if USE_CUSTOM_WAKE_WORD else BUILT_IN_WAKE_WORD.title()
+    print(f"\n🎙️ Say '{wake_phrase}' to wake me up...")
     print("Press Ctrl+C to exit\n")
 else:
-    print("🎙️ Arthur is ready. Say 'Hey Arthur' to begin.\n")
+    wake_phrase = "Hey Arthur" if USE_CUSTOM_WAKE_WORD else BUILT_IN_WAKE_WORD.title()
+    print(f"🎙️ Arthur is ready. Say '{wake_phrase}' to begin.\n")
 
 # --- BACKGROUND WAKE WORD MONITOR ---
 def background_wake_monitor():
-    """Monitor for wake word in background, even during speech"""
-    global wake_word_detected, interrupt_speech, is_speaking
+    """FIXED: Monitor for wake word with proper interrupt handling"""
+    global is_speaking
     
     while True:
         try:
@@ -215,20 +238,21 @@ def background_wake_monitor():
             
             if keyword_index >= 0:
                 if is_speaking:
-                    # Interrupt current speech
-                    interrupt_speech = True
+                    # FIXED: Immediate interrupt with event
+                    interrupt_event.set()
                     if TEST_MODE:
-                        print("\n⚠️ Interrupting - wake word detected during speech!")
-                
-                wake_word_detected = True
+                        print("\n⚠️ INTERRUPT! Wake word detected during speech!")
+                else:
+                    # Normal wake word - add to queue
+                    wake_word_queue.append(time.time())
+                    if TEST_MODE:
+                        print("\n🟢 Wake word detected!")
                 
         except Exception as e:
             if TEST_MODE:
                 print(f"⚠️ Monitor error: {e}")
-            import time
             time.sleep(0.1)
 
-# Start background monitor
 monitor_thread = threading.Thread(target=background_wake_monitor, daemon=True)
 monitor_thread.start()
 
@@ -237,31 +261,25 @@ if TEST_MODE:
 
 # --- FUNCTIONS ---
 def play_audio_file(file_path: str) -> bool:
-    """Play audio file using pygame mixer with interrupt support"""
-    global interrupt_speech
-    
+    """FIXED: Play audio with fast interrupt checking"""
     try:
         pygame.mixer.music.load(file_path)
         pygame.mixer.music.play()
         
-        # Wait for playback to finish, but check for interrupts frequently
+        # FIXED: Check for interrupts much more frequently (100 times per second)
         while pygame.mixer.music.get_busy():
-            if interrupt_speech:
+            if interrupt_event.is_set():
                 pygame.mixer.music.stop()
                 pygame.mixer.music.unload()
                 if TEST_MODE:
-                    print("⚠️ Speech stopped due to interrupt!")
+                    print("⚠️ Speech interrupted!")
                 return False
-            pygame.time.Clock().tick(20)  # Check 20 times per second
+            pygame.time.Clock().tick(100)  # Check 100 times per second for instant response
         
         return True
     except Exception as e:
         print(f"⚠️ Pygame playback failed: {e}")
         return False
-
-def check_for_wake_word_during_speech():
-    """Removed - now handled by background thread"""
-    pass
 
 def record_audio(seconds: int = RECORD_SECONDS, sample_rate: int = SAMPLE_RATE) -> Optional[str]:
     """Records audio after wake word detection"""
@@ -270,7 +288,6 @@ def record_audio(seconds: int = RECORD_SECONDS, sample_rate: int = SAMPLE_RATE) 
     
     stream2 = None
     
-    # Use temporary file to avoid conflicts
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
         output_file = tmp_file.name
     
@@ -333,16 +350,32 @@ def record_audio(seconds: int = RECORD_SECONDS, sample_rate: int = SAMPLE_RATE) 
 
 def transcribe_audio(file_path: str) -> Optional[str]:
     """Converts speech to text using Whisper"""
-    if not file_path or not Path(file_path).exists():
+    if not file_path:
+        print("❌ No file path provided for transcription")
+        return None
+    
+    if not Path(file_path).exists():
+        print(f"❌ Audio file not found: {file_path}")
         return None
     
     try:
         if TEST_MODE:
             print("🔄 Transcribing audio...")
-        result = whisper_model.transcribe(file_path, language="en")
-        return result["text"].strip()
+            print(f"   File: {file_path}")
+            print(f"   Size: {os.path.getsize(file_path)} bytes")
+        
+        result = whisper_model.transcribe(file_path, language="en", fp16=False)
+        transcription = result["text"].strip()
+        
+        if TEST_MODE:
+            print(f"   Transcribed: '{transcription}'")
+        
+        return transcription
     except Exception as e:
         print(f"❌ Transcription error: {e}")
+        import traceback
+        if TEST_MODE:
+            traceback.print_exc()
         return None
 
 def check_special_commands(prompt: str) -> Optional[str]:
@@ -367,16 +400,14 @@ def check_custom_response(prompt: str) -> Optional[str]:
     """Check if the prompt matches any custom responses"""
     prompt_lower = prompt.lower().strip()
     
-    # Remove ALL punctuation and extra spaces
     import re
-    prompt_clean = re.sub(r'[^\w\s]', '', prompt_lower)  # Remove all punctuation
-    prompt_clean = ' '.join(prompt_clean.split())  # Normalize spaces
+    prompt_clean = re.sub(r'[^\w\s]', '', prompt_lower)
+    prompt_clean = ' '.join(prompt_clean.split())
     
     for trigger, response in CUSTOM_RESPONSES.items():
         trigger_clean = re.sub(r'[^\w\s]', '', trigger.lower())
         trigger_clean = ' '.join(trigger_clean.split())
         
-        # Check if trigger phrase is in the prompt
         if trigger_clean in prompt_clean:
             if TEST_MODE:
                 print(f"🎯 Custom response triggered: '{trigger}'")
@@ -388,12 +419,10 @@ def ask_ai(prompt: str) -> str:
     """Send command to OpenAI and get response with conversation memory"""
     global conversation_history
     
-    # First check for special commands (like test mode toggle)
     special_resp = check_special_commands(prompt)
     if special_resp:
         return special_resp
     
-    # Then check for custom responses
     custom_resp = check_custom_response(prompt)
     if custom_resp:
         return custom_resp
@@ -410,11 +439,11 @@ def ask_ai(prompt: str) -> str:
 
 Your personality:
 - Warm, funny, helpful, and personable - like talking to a smart friend
-- Remember context from the conversation naturally and funnily
+- Remember context from the conversation naturally
 - Engage in light humor and wit when appropriate
 - Use casual, natural language (contractions, friendly tone)
-- wittKeep responses concise (2-3 sentences max unless asked for more)
-- Show personality - be y, empathetic, and engaging when appropriate
+- Keep responses concise (2-3 sentences max unless asked for more)
+- Show personality - be witty, empathetic, and engaging
 - If you don't know something, admit it honestly
 - Reference previous parts of the conversation when relevant
 - Use gen z slang occasionally to keep it fresh and clever
@@ -427,22 +456,17 @@ Response style:
 - Ask follow-up questions to keep conversation flowing naturally
 - Show enthusiasm when appropriate with natural expressions
              
-The user
-             
+The user:
 - You are to respond only in English or German if the user talks to you in german
-- The users name is Ronan White, Adress me as Ronan
+- The users name is Ronan White, Address me as Ronan
 - I am a 13 year old teenager with a great sense of humor and love for video games and technology
-- I have a pet dog named Shadow
-- I have a pet dog named Sophie
-- I have a pet dog named Kenzy
-- I have a pet cat named Boots
-- I have a pet cat named Bianca
-- i live in Canada, Newfoundland, in a area called noels pond
-- I love playing survival games like Minecraft, Green hell, Grounded, Grounded 2, and More like those
-- I like the tv shows Dark, Stranger Things, Lost in Space, and more like those"""}
+- I have pet dogs named Shadow, Sophie, and Kenzy
+- I have pet cats named Boots and Bianca
+- I live in Canada, Newfoundland, in an area called Noels Pond
+- I love playing survival games like Minecraft, Green Hell, Grounded, and similar games
+- I like TV shows like Dark, Stranger Things, Lost in Space, and similar sci-fi shows"""}
         ]
         
-        # Thread-safe access to conversation history
         with history_lock:
             for entry in conversation_history[-MAX_HISTORY:]:
                 messages.append({"role": "user", "content": entry["user"]})
@@ -461,7 +485,6 @@ The user
         
         response = completion.choices[0].message.content.strip()
         
-        # Thread-safe update to conversation history
         with history_lock:
             conversation_history.append({
                 "user": prompt,
@@ -484,20 +507,34 @@ The user
             return "Hmm, something went wrong on my end. Mind trying that again?"
 
 def speak_with_tts(text: str, tts_option: int) -> bool:
-    """Speak using a specific TTS engine"""
+    """Speak using a specific TTS engine with interrupt support"""
     audio_file = None
     try:
-        if tts_option == 1:  # gTTS (Google Text-to-Speech)
+        if tts_option == 1:  # gTTS
             if not GTTS_AVAILABLE:
                 return False
             if TEST_MODE:
                 print("🔊 Generating speech with Google TTS...")
+            
+            # FIXED: Check for interrupt before generating
+            if interrupt_event.is_set():
+                return False
+                
             tts = gTTS(text=text, lang='en', slow=False)
             
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_file:
                 audio_file = tmp_file.name
             
             tts.save(audio_file)
+            
+            # FIXED: Check again before playing
+            if interrupt_event.is_set():
+                try:
+                    os.remove(audio_file)
+                except:
+                    pass
+                return False
+            
             if TEST_MODE:
                 print("▶️ Playing audio...")
             
@@ -515,6 +552,11 @@ def speak_with_tts(text: str, tts_option: int) -> bool:
                 return False
             if TEST_MODE:
                 print("🔊 Speaking with pyttsx3...")
+            
+            # FIXED: pyttsx3 doesn't support interrupts well, so check before starting
+            if interrupt_event.is_set():
+                return False
+                
             speak_engine = pyttsx3.init()
             voices = speak_engine.getProperty('voices')
             if voices:
@@ -526,7 +568,7 @@ def speak_with_tts(text: str, tts_option: int) -> bool:
             del speak_engine
             return True
             
-        elif tts_option == 3:  # Edge-TTS (Microsoft)
+        elif tts_option == 3:  # Edge-TTS
             if not EDGE_TTS_AVAILABLE:
                 return False
             import asyncio
@@ -534,6 +576,9 @@ def speak_with_tts(text: str, tts_option: int) -> bool:
             
             if TEST_MODE:
                 print("🔊 Generating speech with Edge-TTS...")
+            
+            if interrupt_event.is_set():
+                return False
             
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_file:
                 audio_file = tmp_file.name
@@ -543,6 +588,14 @@ def speak_with_tts(text: str, tts_option: int) -> bool:
                 await communicate.save(audio_file)
             
             asyncio.run(generate_speech())
+            
+            if interrupt_event.is_set():
+                try:
+                    os.remove(audio_file)
+                except:
+                    pass
+                return False
+            
             if TEST_MODE:
                 print("▶️ Playing audio...")
             
@@ -562,16 +615,27 @@ def speak_with_tts(text: str, tts_option: int) -> bool:
             if TEST_MODE:
                 print("🔊 Generating speech with OpenAI TTS...")
             
+            if interrupt_event.is_set():
+                return False
+            
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_file:
                 audio_file = tmp_file.name
             
             response = client.audio.speech.create(
                 model="tts-1",
-                voice="onyx",  # Options: alloy, echo, fable, onyx, nova, shimmer
+                voice="onyx",
                 input=text
             )
             
             response.stream_to_file(audio_file)
+            
+            if interrupt_event.is_set():
+                try:
+                    os.remove(audio_file)
+                except:
+                    pass
+                return False
+            
             if TEST_MODE:
                 print("▶️ Playing audio...")
             
@@ -596,53 +660,65 @@ def speak_with_tts(text: str, tts_option: int) -> bool:
         return False
 
 def speak(text: str) -> bool:
-    """Text-to-speech output with automatic fallback"""
-    global current_tts, tts_failed, is_speaking, interrupt_speech
+    """FIXED: Text-to-speech with proper interrupt handling"""
+    global current_tts, tts_failed, is_speaking
     
     if not TEST_MODE:
         print(f"Arthur: {text}")
     else:
         print(f"💬 Arthur: {text}")
     
+    # FIXED: Clear any previous interrupts and set speaking flag
+    interrupt_event.clear()
     is_speaking = True
     
-    # Try current TTS
-    success = speak_with_tts(text, current_tts)
-    
-    is_speaking = False
-    
-    if success:
-        if TEST_MODE:
-            print("✅ Speech completed!")
-        return True
-    
-    # Mark as failed
-    tts_failed[current_tts] = True
-    
-    # Try fallback options if enabled
-    if ENABLE_TTS_FALLBACK:
-        fallback_order = [1, 2, 4, 3]  # gTTS, pyttsx3, OpenAI, Edge-TTS
+    try:
+        # Try current TTS
+        success = speak_with_tts(text, current_tts)
         
-        for tts_opt in fallback_order:
-            if tts_opt != current_tts and not tts_failed[tts_opt]:
-                if TEST_MODE:
-                    print(f"⚠️ Trying fallback TTS option {tts_opt}...")
-                
-                is_speaking = True
-                success = speak_with_tts(text, tts_opt)
-                is_speaking = False
-                
-                if success:
-                    current_tts = tts_opt
+        # FIXED: Check if we were interrupted
+        if interrupt_event.is_set():
+            if TEST_MODE:
+                print("❌ Speech was interrupted")
+            return False
+        
+        if success:
+            if TEST_MODE:
+                print("✅ Speech completed!")
+            return True
+        
+        # Mark as failed
+        tts_failed[current_tts] = True
+        
+        # Try fallback options if enabled
+        if ENABLE_TTS_FALLBACK and not interrupt_event.is_set():
+            fallback_order = [1, 2, 4, 3]
+            
+            for tts_opt in fallback_order:
+                if tts_opt != current_tts and not tts_failed[tts_opt]:
                     if TEST_MODE:
-                        print(f"✅ Switched to TTS option {tts_opt}")
-                    return True
-                else:
-                    tts_failed[tts_opt] = True
-    
-    if TEST_MODE:
-        print("❌ All TTS options failed. Text displayed above.")
-    return False
+                        print(f"⚠️ Trying fallback TTS option {tts_opt}...")
+                    
+                    success = speak_with_tts(text, tts_opt)
+                    
+                    if interrupt_event.is_set():
+                        return False
+                    
+                    if success:
+                        current_tts = tts_opt
+                        if TEST_MODE:
+                            print(f"✅ Switched to TTS option {tts_opt}")
+                        return True
+                    else:
+                        tts_failed[tts_opt] = True
+        
+        if TEST_MODE:
+            print("❌ All TTS options failed. Text displayed above.")
+        return False
+        
+    finally:
+        # FIXED: Always clear speaking flag
+        is_speaking = False
 
 def cleanup_temp_files():
     """Clean up any leftover temporary files"""
@@ -665,21 +741,19 @@ def cleanup_temp_files():
 try:
     while True:
         try:
-            # Wait for wake word from background monitor
-            if wake_word_detected:
-                wake_word_detected = False  # Reset
+            # FIXED: Check wake word queue instead of global flag
+            if wake_word_queue:
+                wake_word_queue.clear()  # Clear all queued wake words
                 
-                if TEST_MODE:
-                    print("\n🟢 Wake word detected!")
-                
-                # Stop any ongoing speech
+                # FIXED: Stop any ongoing speech immediately
                 if is_speaking:
+                    interrupt_event.set()
                     pygame.mixer.music.stop()
                     is_speaking = False
-                    import time
-                    time.sleep(0.2)  # Brief pause after interrupt
+                    time.sleep(0.3)  # Give time for cleanup
                 
-                interrupt_speech = False
+                # Clear interrupt for new recording
+                interrupt_event.clear()
                 
                 # Record and process command
                 audio_file = record_audio()
@@ -698,7 +772,6 @@ try:
                         if TEST_MODE:
                             print("🔊 Preparing to speak...")
                         
-                        interrupt_speech = False
                         speak(response)
                         
                         if TEST_MODE:
@@ -706,7 +779,6 @@ try:
                                 if len(conversation_history) > 0:
                                     print(f"💭 Conversation memory: {len(conversation_history)} exchanges")
                         
-                        # Clean up audio file
                         try:
                             os.remove(audio_file)
                         except:
@@ -719,8 +791,6 @@ try:
                 if TEST_MODE:
                     print("\n🎙️ Ready for next command...")
             
-            # Small sleep to avoid CPU spinning
-            import time
             time.sleep(0.05)
                 
         except IOError:
