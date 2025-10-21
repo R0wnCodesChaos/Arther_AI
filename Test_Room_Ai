@@ -11,6 +11,7 @@ import threading
 from typing import Optional
 import pygame
 import time
+import numpy as np
 
 # TTS Options - choose one by setting USE_TTS to the option number
 USE_TTS = 1  # 1=gTTS (Google) - RECOMMENDED, 2=pyttsx3 (offline), 3=Edge-TTS (may not work), 4=OpenAI TTS
@@ -59,15 +60,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Microphone selection - CHANGE THIS NUMBER TO USE A DIFFERENT MIC
 MICROPHONE_INDEX = 1  # None = default, or set to 0, 1, 2, etc. for specific device
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # --- MODE SETTINGS ---
 TEST_MODE = True  # Change to True to see all the technical details
 
-# Audio recording settings
-RECORD_SECONDS = 5
-SAMPLE_RATE = 16000
-CHUNK_SIZE = 1024
+# FIXED: Improved audio recording settings for better quality
+RECORD_SECONDS = 6  # Slightly longer for better capture
+SAMPLE_RATE = 16000  # Whisper's preferred rate
+CHUNK_SIZE = 512  # Smaller chunks for better responsiveness
 
 # Conversation memory
 conversation_history = []
@@ -184,9 +184,6 @@ if TEST_MODE:
     print("✅ Whisper ready")
 
 # --- AUDIO SETUP ---
-# Set to None for default mic, or specific number (0, 1, 2, etc.) for a specific device
-MICROPHONE_INDEX = None  # Change this if you need a specific microphone
-
 stream = None
 try:
     # Show which microphone is being used
@@ -281,10 +278,19 @@ def play_audio_file(file_path: str) -> bool:
         print(f"⚠️ Pygame playback failed: {e}")
         return False
 
+def detect_silence(audio_data, threshold=500, min_silence_duration=1.0):
+    """FIXED: Detect when user stops speaking"""
+    # Convert bytes to numpy array
+    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+    # Calculate RMS (volume)
+    rms = np.sqrt(np.mean(audio_array**2))
+    return rms < threshold
+
 def record_audio(seconds: int = RECORD_SECONDS, sample_rate: int = SAMPLE_RATE) -> Optional[str]:
-    """Records audio after wake word detection"""
+    """FIXED: Records audio with better quality and silence detection"""
     if TEST_MODE:
-        print(f"🎧 Listening for {seconds} seconds...")
+        print(f"🎧 Listening for up to {seconds} seconds...")
+        print("   💡 Speak clearly into your microphone")
     
     stream2 = None
     
@@ -292,21 +298,53 @@ def record_audio(seconds: int = RECORD_SECONDS, sample_rate: int = SAMPLE_RATE) 
         output_file = tmp_file.name
     
     try:
+        # FIXED: Better audio stream configuration
         stream2 = pa.open(
             format=pyaudio.paInt16,
             channels=1,
             rate=sample_rate,
             input=True,
-            frames_per_buffer=CHUNK_SIZE
+            frames_per_buffer=CHUNK_SIZE,
+            input_device_index=MICROPHONE_INDEX  # Use same mic as wake word
         )
         
+        # FIXED: Discard first few frames to avoid wake word bleed
+        if TEST_MODE:
+            print("   🔇 Clearing audio buffer...")
+        for _ in range(5):
+            try:
+                stream2.read(CHUNK_SIZE, exception_on_overflow=False)
+            except:
+                pass
+        
+        time.sleep(0.2)  # Brief pause before recording
+        
+        if TEST_MODE:
+            print("   🎤 Recording now!")
+        
         frames = []
+        silence_chunks = 0
+        max_silence_chunks = int(1.5 * sample_rate / CHUNK_SIZE)  # 1.5 seconds of silence
+        
         for i in range(int(sample_rate / CHUNK_SIZE * seconds)):
             try:
                 data = stream2.read(CHUNK_SIZE, exception_on_overflow=False)
                 frames.append(data)
+                
+                # FIXED: Early stop on prolonged silence (after getting some audio)
+                if len(frames) > 10:  # Only check after getting some audio
+                    if detect_silence(data):
+                        silence_chunks += 1
+                        if silence_chunks > max_silence_chunks:
+                            if TEST_MODE:
+                                print("   ⏹️ Silence detected, stopping early")
+                            break
+                    else:
+                        silence_chunks = 0
+                        
             except Exception as e:
-                print(f"⚠️ Audio buffer overflow: {e}")
+                if TEST_MODE:
+                    print(f"⚠️ Audio buffer issue: {e}")
                 continue
         
         if stream2:
@@ -318,6 +356,11 @@ def record_audio(seconds: int = RECORD_SECONDS, sample_rate: int = SAMPLE_RATE) 
             print("❌ No audio data captured")
             return None
         
+        # FIXED: Verify we have meaningful audio
+        if len(frames) < 3:
+            print("❌ Recording too short")
+            return None
+        
         try:
             with wave.open(output_file, "wb") as wf:
                 wf.setnchannels(1)
@@ -325,12 +368,18 @@ def record_audio(seconds: int = RECORD_SECONDS, sample_rate: int = SAMPLE_RATE) 
                 wf.setframerate(sample_rate)
                 wf.writeframes(b"".join(frames))
             
-            if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+            file_size = os.path.getsize(output_file)
+            
+            if file_size > 1000:  # At least 1KB
                 if TEST_MODE:
-                    print(f"✅ Audio saved to {output_file}")
+                    print(f"✅ Audio captured: {file_size} bytes, {len(frames)} frames")
                 return output_file
             else:
-                print("❌ Audio file not created properly")
+                print("❌ Audio file too small")
+                try:
+                    os.remove(output_file)
+                except:
+                    pass
                 return None
                 
         except Exception as e:
@@ -349,7 +398,7 @@ def record_audio(seconds: int = RECORD_SECONDS, sample_rate: int = SAMPLE_RATE) 
                 pass
 
 def transcribe_audio(file_path: str) -> Optional[str]:
-    """Converts speech to text using Whisper"""
+    """FIXED: Better transcription with error handling"""
     if not file_path:
         print("❌ No file path provided for transcription")
         return None
@@ -360,19 +409,47 @@ def transcribe_audio(file_path: str) -> Optional[str]:
     
     try:
         if TEST_MODE:
-            print("🔄 Transcribing audio...")
-            print(f"   File: {file_path}")
-            print(f"   Size: {os.path.getsize(file_path)} bytes")
+            print("🔄 Transcribing audio with Whisper...")
+            print(f"   📁 File: {os.path.basename(file_path)}")
+            print(f"   📊 Size: {os.path.getsize(file_path):,} bytes")
         
-        result = whisper_model.transcribe(file_path, language="en", fp16=False)
+        # FIXED: Better Whisper parameters for accuracy
+        result = whisper_model.transcribe(
+            file_path, 
+            language="en",
+            fp16=False,
+            temperature=0.0,  # More deterministic
+            compression_ratio_threshold=2.4,
+            logprob_threshold=-1.0,
+            no_speech_threshold=0.6,
+            condition_on_previous_text=False  # Better for short commands
+        )
+        
         transcription = result["text"].strip()
         
+        # FIXED: Better validation
+        if not transcription:
+            print("❌ Empty transcription")
+            return None
+        
+        # Remove common artifacts
+        transcription = transcription.replace("[BLANK_AUDIO]", "").strip()
+        
         if TEST_MODE:
-            print(f"   Transcribed: '{transcription}'")
+            confidence = result.get("language_probability", 0)
+            print(f"   📝 Transcribed: '{transcription}'")
+            print(f"   ✅ Confidence: {confidence:.2%}")
+        
+        # Validate minimum length
+        if len(transcription) < 2:
+            if TEST_MODE:
+                print("⚠️ Transcription too short, likely noise")
+            return None
         
         return transcription
+        
     except Exception as e:
-        print(f"❌ Transcription error: {e}")
+        print(f"❌ Transcription error: {type(e).__name__}: {e}")
         import traceback
         if TEST_MODE:
             traceback.print_exc()
@@ -761,7 +838,8 @@ try:
                 if audio_file:
                     command = transcribe_audio(audio_file)
                     
-                    if command and len(command) > 2:
+                    # FIXED: Better validation of transcription
+                    if command and len(command.strip()) > 2:
                         if TEST_MODE:
                             print(f"🗣️ You said: {command}")
                         else:
@@ -779,13 +857,22 @@ try:
                                 if len(conversation_history) > 0:
                                     print(f"💭 Conversation memory: {len(conversation_history)} exchanges")
                         
+                        # Clean up audio file
                         try:
                             os.remove(audio_file)
                         except:
                             pass
                     else:
-                        speak("I didn't catch that. Could you repeat?")
+                        if TEST_MODE:
+                            print("⚠️ Could not understand speech (too short or unclear)")
+                        speak("I didn't catch that. Could you speak a bit louder?")
+                        try:
+                            os.remove(audio_file)
+                        except:
+                            pass
                 else:
+                    if TEST_MODE:
+                        print("⚠️ Recording failed or returned no file")
                     speak("I had trouble recording. Please try again.")
                 
                 if TEST_MODE:
@@ -793,7 +880,9 @@ try:
             
             time.sleep(0.05)
                 
-        except IOError:
+        except IOError as e:
+            if TEST_MODE:
+                print(f"⚠️ I/O Error in main loop: {e}")
             continue
             
 except KeyboardInterrupt:
