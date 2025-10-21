@@ -181,7 +181,7 @@ try:
         format=pyaudio.paInt16,
         input=True,
         frames_per_buffer=porcupine.frame_length,
-        input_device_index=None
+        input_device_index=1
     )
     if TEST_MODE:
         print("✅ Microphone stream active")
