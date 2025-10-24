@@ -1,24 +1,60 @@
 import pvporcupine, pyaudio, struct, whisper, wave, os, tempfile, threading, pygame, time, numpy as np
-from openai import OpenAI
+import ollama
 from gtts import gTTS
 from pathlib import Path
 from typing import Optional
-#========================================================================================= CONFIGURATION
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# ⚙️  CONFIGURATION
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
 ACCESS_KEY = os.getenv("PORCUPINE_ACCESS_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 USE_CUSTOM_WAKE_WORD, WAKE_WORD_PATH, BUILT_IN_WAKE_WORD = True, "Hey-Arthur_en_windows_v3_0_0.ppn", "jarvis"
-MICROPHONE_INDEX, RECORD_SECONDS, SAMPLE_RATE, CHUNK_SIZE = 1, 6, 16000, 512
+MICROPHONE_INDEX, RECORD_SECONDS, SAMPLE_RATE, CHUNK_SIZE = 1, 30, 16000, 512  # Max 30 seconds
+SILENCE_THRESHOLD = 500  # Lower = more sensitive to silence
+SILENCE_DURATION = 1.5  # Seconds of silence before stopping
 MAX_HISTORY, TEST_MODE = 10, True
-USER_NAME, USER_AGE, USER_LOCATION = "Ronan", 13, "Noels Pond, Newfoundland, Canada"
-USER_PETS = "dogs (Shadow, Sophie, Kenzy), cats (Boots, Bianca)"
-USER_INTERESTS = "video games (Minecraft, Green Hell, Grounded), sci-fi shows (Dark, Stranger Things, Lost in Space)"
+OLLAMA_MODEL = "llama3.2:3b"  # Options: llama3.2:1b, llama3.2:3b, mistral, phi3, gemma2, etc.
+USER_INFO = """Name: Ronan
+Age: 13
+Location: Noels Pond, Newfoundland, Canada
+Personality:
+Smart-ass, adventurous, sarcastic, and funny. Dark sense of humor, usually jokes around and doesn't take things too seriously. Likes when Arthur talks like a friend — casual, witty, and not robotic.
+Interests:
+Loves gaming (Grounded 2, Roblox, Trailmakers) and tech. Excited for Subnautica 2 and the next Grounded update. Watches mostly gaming and tech content on YouTube.
+Media & Fandoms:
+Favorite shows are Stranger Things and Dark ("that cool German show"). Doesn't really have a favorite character but enjoys mysterious or sci-fi vibes.
+School & Learning:
+Enjoys gym, math, tech, and ELA. Tolerates social studies, French, and religion. Thinks health class is boring.
+Sports & Activities:
+Does Taekwondo during the school season, swims all year, and goes skiing in the winter when there's snow.
+Setup:
+Ryzen 5 5600X (6 core), 16GB RAM, 970 EVO Plus 1TB SSD, RX 6600 GPU, dual monitors, mouse, keyboard, and a Soomfon stream controller.
+Pets:
+• Sophie — 3 years old (Oct 2025), cute but energetic and not quite trained.
+• Shadow — 3 months old (Oct 2025), mischievous but well-trained for a pup.
+• Kenzy — 11 years old (Oct 2025), lazy and loves belly rubs.
+• Boots — friendly cat, not shy.
+• Bianca — shy cat, keeps to herself.
+Friends & Family:
+Has two close friends (Alex and Matheo, both male). Two siblings (Isaac — brother, Freya — sister). Calls parents simply Mom and Dad."""
 CUSTOM_RESPONSES = {"brother iq": "Your brother's IQ is lower than a rock. Just kidding!", "brothers iq": "Your brother's IQ is lower than a rock. Just kidding!"}
-AI_NAME, AI_MODEL, AI_MAX_TOKENS, AI_TEMPERATURE = "Arthur", "gpt-4o-mini", 200, 0.8
-#========================================================================================= INITIALIZATION
+AI_NAME, AI_MAX_TOKENS, AI_TEMPERATURE = "Arthur", 200, 0.8
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# 🔧 INITIALIZATION
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
 pygame.mixer.init()
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY and OPENAI_API_KEY.startswith("sk-") else None
 conversation_history, wake_word_queue, interrupt_event, is_speaking = [], [], threading.Event(), False
 history_lock, stream_lock = threading.Lock(), threading.Lock()
+
+# Test Ollama connection
+try:
+    ollama.list()
+    print(f"✅ Ollama connected | Model: {OLLAMA_MODEL}")
+except Exception as e:
+    print(f"⚠️ Ollama not running! Start it with: ollama serve")
+    print(f"   Then run: ollama pull {OLLAMA_MODEL}")
+    exit(1)
 
 porcupine = pvporcupine.create(access_key=ACCESS_KEY, keyword_paths=[WAKE_WORD_PATH] if USE_CUSTOM_WAKE_WORD else None, keywords=None if USE_CUSTOM_WAKE_WORD else [BUILT_IN_WAKE_WORD])
 whisper_model = whisper.load_model("base")
@@ -26,7 +62,10 @@ pa = pyaudio.PyAudio()
 stream = pa.open(rate=porcupine.sample_rate, channels=1, format=pyaudio.paInt16, input=True, frames_per_buffer=porcupine.frame_length, input_device_index=MICROPHONE_INDEX)
 
 print(f"✅ {AI_NAME} initialized | Mic: {pa.get_device_info_by_index(MICROPHONE_INDEX)['name'] if MICROPHONE_INDEX else 'default'}")
-#========================================================================================= CORE FUNCTIONS
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# 🔊 CORE FUNCTIONS
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
 def background_wake_monitor():
     global is_speaking
     while True:
@@ -41,27 +80,40 @@ def background_wake_monitor():
             time.sleep(0.1)
 
 def record_audio(seconds: int = RECORD_SECONDS) -> Optional[str]:
-    TEST_MODE and print(f"🎧 Listening for up to {seconds} seconds...")
+    TEST_MODE and print(f"🎧 Listening... (speak now, I'll stop when you're done)")
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
         output_file = tmp_file.name
     try:
         stream2 = pa.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE, input=True, frames_per_buffer=CHUNK_SIZE, input_device_index=MICROPHONE_INDEX)
         [stream2.read(CHUNK_SIZE, exception_on_overflow=False) for _ in range(5)]
         time.sleep(0.2)
-        TEST_MODE and print("   🎤 Recording now!")
-        frames, silence_chunks, max_silence = [], 0, int(1.5 * SAMPLE_RATE / CHUNK_SIZE)
+        TEST_MODE and print("   🎤 Recording now! (speak naturally)")
+        frames, silence_chunks = [], 0
+        max_silence = int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SIZE)
+        started_speaking = False
+        
         for _ in range(int(SAMPLE_RATE / CHUNK_SIZE * seconds)):
             data = stream2.read(CHUNK_SIZE, exception_on_overflow=False)
             frames.append(data)
-            if len(frames) > 10:
-                rms = np.sqrt(np.mean(np.square(np.frombuffer(data, dtype=np.int16).astype(np.float64))))
-                if rms < 500:
+            
+            # Calculate volume
+            rms = np.sqrt(np.mean(np.square(np.frombuffer(data, dtype=np.int16).astype(np.float64))))
+            
+            # Detect if user started speaking
+            if not started_speaking and rms > SILENCE_THRESHOLD:
+                started_speaking = True
+                TEST_MODE and print("   🗣️ Speech detected!")
+            
+            # Only check for silence after user started speaking
+            if started_speaking:
+                if rms < SILENCE_THRESHOLD:
                     silence_chunks += 1
                     if silence_chunks > max_silence:
-                        TEST_MODE and print("   ⏹️ Silence detected")
+                        TEST_MODE and print("   ⏹️ Silence detected, stopping")
                         break
                 else:
                     silence_chunks = 0
+        
         stream2.stop_stream()
         stream2.close()
         if frames and len(frames) >= 3:
@@ -102,31 +154,40 @@ def ask_ai(prompt: str) -> str:
     for trigger, response in CUSTOM_RESPONSES.items():
         if trigger in prompt_clean:
             return response
-    if not client:
-        return "My AI brain isn't connected. Please configure the OpenAI API key."
     try:
         TEST_MODE and print("🤔 Thinking...")
-        messages = [{"role": "system", "content": f"""You are {AI_NAME}, a friendly and conversational AI assistant.
+        messages = [{"role": "system", "content": f"""You are {AI_NAME}, a friendly and conversational AI assistant. Answer questions directly and accurately.
 
-Your personality: Warm, funny, helpful, personable. Use casual language, contractions, wit, and occasional gen z slang. Keep responses 2-3 sentences unless asked for more. Be natural and engaging like a smart friend.
+Personality: Warm, funny, helpful, personable. Use casual language, contractions, wit, and occasional gen z slang. Keep responses 2-3 sentences unless asked for more. Be natural and engaging like a smart friend.
 
-The user: {USER_NAME}, {USER_AGE} years old, lives in {USER_LOCATION}. Pets: {USER_PETS}. Interests: {USER_INTERESTS}. Respond in English or German if they speak German."""}]
+User Info:
+{USER_INFO}
+
+Important: Always answer the user's actual question first, then add personality. Respond in English or German if they speak German."""}]
         with history_lock:
             for entry in conversation_history[-MAX_HISTORY:]:
                 messages.extend([{"role": "user", "content": entry["user"]}, {"role": "assistant", "content": entry["assistant"]}])
         messages.append({"role": "user", "content": prompt})
-        response = client.chat.completions.create(model=AI_MODEL, messages=messages, max_tokens=AI_MAX_TOKENS, temperature=AI_TEMPERATURE, presence_penalty=0.6, frequency_penalty=0.3).choices[0].message.content.strip()
+        
+        # Use Ollama instead of OpenAI
+        response = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=messages,
+            options={
+                "temperature": AI_TEMPERATURE,
+                "num_predict": AI_MAX_TOKENS,
+            }
+        )
+        
+        response_text = response['message']['content'].strip()
+        
         with history_lock:
-            conversation_history.append({"user": prompt, "assistant": response})
+            conversation_history.append({"user": prompt, "assistant": response_text})
             conversation_history = conversation_history[-MAX_HISTORY:] if len(conversation_history) > MAX_HISTORY else conversation_history
-        return response
+        return response_text
     except Exception as e:
-        if "authentication" in str(e).lower() or "401" in str(e):
-            return "I'm having trouble connecting. Please check the API key."
-        elif "429" in str(e):
-            return "Whoa, I'm getting overwhelmed. Give me a moment?"
         print(f"❌ AI error: {e}")
-        return "Hmm, something went wrong. Mind trying again?"
+        return "Hmm, something went wrong. Is Ollama running?"
 
 def play_audio(file_path: str) -> bool:
     try:
@@ -166,7 +227,10 @@ def speak(text: str) -> bool:
         return False
     finally:
         is_speaking = False
-#========================================================================================= MAIN LOOP
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# 🚀 MAIN LOOP
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
 threading.Thread(target=background_wake_monitor, daemon=True).start()
 wake_phrase = "Hey Arthur" if USE_CUSTOM_WAKE_WORD else BUILT_IN_WAKE_WORD.title()
 print(f"🎙️ {AI_NAME} is ready. Say '{wake_phrase}' to begin.\n")
