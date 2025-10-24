@@ -1,107 +1,110 @@
 import pvporcupine, pyaudio, struct, whisper, wave, os, tempfile, threading, time, numpy as np
-import ollama
-import pyttsx3
+import ollama, pyttsx3, queue
 from pathlib import Path
 from typing import Optional
 from collections import deque
-import queue
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
-# ⚙️  CONFIGURATION
+# ⚙️ CONFIG
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 ACCESS_KEY = os.getenv("PORCUPINE_ACCESS_KEY")
-USE_CUSTOM_WAKE_WORD, WAKE_WORD_PATH, BUILT_IN_WAKE_WORD = True, "Hey-Arthur_en_windows_v3_0_0.ppn", "jarvis"
-MICROPHONE_INDEX, RECORD_SECONDS, SAMPLE_RATE, CHUNK_SIZE = 1, 30, 16000, 512
-SILENCE_THRESHOLD = 500
-SILENCE_DURATION = 1.5
-MIN_SPEECH_DURATION = 0.3  # Minimum speech duration in seconds
-MAX_HISTORY, TEST_MODE = 10, True
-OLLAMA_MODEL = "llama3.2:3b"
+WAKE_WORD_PATH = "Hey-Arthur_en_windows_v3_0_0.ppn"
+MIC_INDEX, SAMPLE_RATE, CHUNK = 1, 16000, 512
+SILENCE_THRESH, SILENCE_TIME, MIN_SPEECH = 500, 1.5, 0.3
+OLLAMA_MODEL, MAX_TOKENS, TEMP = "llama3.2:3b", 150, 0.7
+VOICE_RATE = 180
+
 USER_INFO = """Name: Ronan
 Age: 13
 Location: Noels Pond, Newfoundland, Canada
-Personality: Smart-ass, adventurous, sarcastic, and funny. Dark sense of humor.
-Interests: Gaming (Grounded 2, Roblox, Trailmakers), tech, Subnautica 2
-Media: Stranger Things, Dark
-School: Enjoys gym, math, tech, ELA
-Sports: Taekwondo, swimming, skiing
-Setup: Ryzen 5 5600X, 16GB RAM, RX 6600 GPU
-Pets: Sophie (3yo), Shadow (3mo), Kenzy (11yo), Boots, Bianca
-Friends: Alex, Matheo | Siblings: Isaac, Freya"""
+
+Personality:
+Smart-ass, adventurous, sarcastic, and funny. Dark sense of humor, usually jokes around and doesn’t take things too seriously. Likes when Arthur talks like a friend — casual, witty, and not robotic.
+
+Interests:
+Loves gaming (Grounded 2, Roblox, Trailmakers) and tech. Excited for Subnautica 2 and the next Grounded update. Watches mostly gaming and tech content on YouTube.
+
+Media & Fandoms:
+Favorite shows are Stranger Things and Dark (“that cool German show”). Doesn’t really have a favorite character but enjoys mysterious or sci-fi vibes.
+
+School & Learning:
+Enjoys gym, math, tech, and ELA. Tolerates social studies, French, and religion. Thinks health class is boring.
+
+Sports & Activities:
+Does Taekwondo during the school season, swims all year, and goes skiing in the winter when there’s snow.
+
+Setup:
+Ryzen 5 5600X (6 core), 16GB RAM, 970 EVO Plus 1TB SSD, RX 6600 GPU, dual monitors, mouse, keyboard, and a Soomfon stream controller.
+
+Pets:
+• Sophie — 3 years old (Oct 2025), cute but energetic and not quite trained.
+• Shadow — 3 months old (Oct 2025), mischievous but well-trained for a pup.
+• Kenzy — 11 years old (Oct 2025), lazy and loves belly rubs.
+• Boots — friendly cat, not shy.
+• Bianca — shy cat, keeps to herself.
+
+Friends & Family:
+Has two close friends (Alex and Matheo, both male). Two siblings (Isaac — brother, Freya — sister). Calls parents simply Mom and Dad.
+"""
+
 
 CUSTOM_RESPONSES = {
     "brother iq": "Your brother's IQ is lower than a rock. Just kidding!",
     "brothers iq": "Your brother's IQ is lower than a rock. Just kidding!"
 }
-AI_NAME, AI_MAX_TOKENS, AI_TEMPERATURE = "Arthur", 200, 0.8
-VOICE_RATE, VOICE_VOLUME = 160, 1.0
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
-# 🔧 INITIALIZATION
+# 🤖 ASSISTANT
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 class VoiceAssistant:
     def __init__(self):
-        # State management
-        self.conversation_history = deque(maxlen=MAX_HISTORY)
-        self.wake_word_queue = queue.Queue()
-        self.interrupt_event = threading.Event()
-        self.is_speaking = threading.Lock()
-        self.speaking_flag = False
+        self.history = deque(maxlen=10)
+        self.wake_queue = queue.Queue()
+        self.interrupt = threading.Event()
+        self.speaking = False
         self.audio_lock = threading.Lock()
-        self.test_mode = TEST_MODE
-        self.tts_lock = threading.Lock()
         
-        # Initialize Ollama
+        # Check Ollama
         try:
             ollama.list()
-            print(f"✅ Ollama connected | Model: {OLLAMA_MODEL}")
-        except Exception as e:
-            print(f"⚠️ Ollama not running! Start it with: ollama serve")
+            print(f"✅ Ollama: {OLLAMA_MODEL}")
+        except:
+            print("⚠️ Start Ollama with: ollama serve")
             exit(1)
         
-        # Initialize TTS engine (offline)
-        self.tts_engine = pyttsx3.init()
-        voices = self.tts_engine.getProperty('voices')
+        # TTS
+        self.tts = pyttsx3.init()
+        voices = self.tts.getProperty('voices')
         if voices:
-            self.tts_engine.setProperty('voice', voices[0].id)
-        self.tts_engine.setProperty('rate', VOICE_RATE)
-        self.tts_engine.setProperty('volume', VOICE_VOLUME)
-        print(f"✅ Offline TTS initialized (pyttsx3)")
+            self.tts.setProperty('voice', voices[0].id)
+        self.tts.setProperty('rate', VOICE_RATE)
+        self.tts.setProperty('volume', 1.0)
         
-        # Initialize Porcupine
+        # Porcupine
         self.porcupine = pvporcupine.create(
             access_key=ACCESS_KEY,
-            keyword_paths=[WAKE_WORD_PATH] if USE_CUSTOM_WAKE_WORD else None,
-            keywords=None if USE_CUSTOM_WAKE_WORD else [BUILT_IN_WAKE_WORD]
+            keyword_paths=[WAKE_WORD_PATH]
         )
         
-        # Initialize Whisper
-        self.whisper_model = whisper.load_model("base")
+        # Whisper
+        print("🔄 Loading Whisper...")
+        self.whisper = whisper.load_model("tiny")
         
-        # Initialize PyAudio
+        # Audio
         self.pa = pyaudio.PyAudio()
-        self.stream = None
-        self._init_audio_stream()
-        
-        print(f"✅ {AI_NAME} initialized")
-    
-    def _init_audio_stream(self):
-        """Initialize audio stream with proper settings"""
-        if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-        
         self.stream = self.pa.open(
             rate=self.porcupine.sample_rate,
             channels=1,
             format=pyaudio.paInt16,
             input=True,
             frames_per_buffer=self.porcupine.frame_length,
-            input_device_index=MICROPHONE_INDEX
+            input_device_index=MIC_INDEX
         )
+        
+        print("✅ Arthur ready!")
     
-    def background_wake_monitor(self):
-        """Monitor for wake word in background"""
+    def monitor_wake_word(self):
+        """Background wake word detection"""
         while True:
             try:
                 with self.audio_lock:
@@ -111,331 +114,201 @@ class VoiceAssistant:
                         time.sleep(0.1)
                         continue
                 
-                result = self.porcupine.process(struct.unpack_from("h" * self.porcupine.frame_length, pcm))
-                
-                if result >= 0:
-                    if self.speaking_flag:
-                        self.interrupt_event.set()
-                        self.test_mode and print(f"\n⚠️ INTERRUPT!")
+                if self.porcupine.process(struct.unpack_from("h" * self.porcupine.frame_length, pcm)) >= 0:
+                    if self.speaking:
+                        self.interrupt.set()
+                        print("\n⚠️ INTERRUPT!")
                     else:
-                        self.wake_word_queue.put(time.time())
-                        self.test_mode and print(f"\n🟢 Wake word detected!")
-            
+                        self.wake_queue.put(time.time())
+                        print("\n🟢 Wake word!")
             except Exception as e:
-                self.test_mode and print(f"⚠️ Monitor error: {e}")
+                print(f"⚠️ {e}")
                 time.sleep(0.1)
     
-    def record_audio(self, seconds: int = RECORD_SECONDS) -> Optional[str]:
-        """Record audio with improved silence detection"""
-        self.test_mode and print(f"🎧 Listening...")
-        
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-            output_file = tmp_file.name
+    def record(self) -> Optional[str]:
+        """Record audio until silence"""
+        print("🎤 Listening...")
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         
         try:
-            # Temporarily pause wake word stream and create recording stream
             with self.audio_lock:
                 self.stream.stop_stream()
             
-            stream2 = self.pa.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=SAMPLE_RATE,
-                input=True,
-                frames_per_buffer=CHUNK_SIZE,
-                input_device_index=MICROPHONE_INDEX
+            rec_stream = self.pa.open(
+                format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
+                input=True, frames_per_buffer=CHUNK, input_device_index=MIC_INDEX
             )
             
             # Clear buffer
             for _ in range(5):
-                stream2.read(CHUNK_SIZE, exception_on_overflow=False)
+                rec_stream.read(CHUNK, exception_on_overflow=False)
             time.sleep(0.2)
             
-            self.test_mode and print("   🎤 Recording now!")
+            frames, silence_cnt, speech_cnt = [], 0, 0
+            max_silence = int(SILENCE_TIME * SAMPLE_RATE / CHUNK)
+            min_speech = int(MIN_SPEECH * SAMPLE_RATE / CHUNK)
+            speaking = False
             
-            frames = []
-            silence_chunks = 0
-            speech_chunks = 0
-            max_silence = int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SIZE)
-            min_speech = int(MIN_SPEECH_DURATION * SAMPLE_RATE / CHUNK_SIZE)
-            started_speaking = False
-            
-            for _ in range(int(SAMPLE_RATE / CHUNK_SIZE * seconds)):
-                data = stream2.read(CHUNK_SIZE, exception_on_overflow=False)
+            for _ in range(int(SAMPLE_RATE / CHUNK * 30)):
+                data = rec_stream.read(CHUNK, exception_on_overflow=False)
                 frames.append(data)
                 
-                # Calculate RMS energy
-                audio_data = np.frombuffer(data, dtype=np.int16)
-                rms = np.sqrt(np.mean(np.square(audio_data.astype(np.float32))))
+                rms = np.sqrt(np.mean(np.square(np.frombuffer(data, dtype=np.int16).astype(np.float32))))
                 
-                # Detect speech
-                if rms > SILENCE_THRESHOLD:
-                    speech_chunks += 1
-                    silence_chunks = 0
-                    
-                    if not started_speaking and speech_chunks >= 2:  # Require 2 consecutive chunks
-                        started_speaking = True
-                        self.test_mode and print("   🗣️ Speech detected!")
+                if rms > SILENCE_THRESH:
+                    speech_cnt += 1
+                    silence_cnt = 0
+                    if not speaking and speech_cnt >= 2:
+                        speaking = True
+                        print("   🗣️ Speaking...")
                 else:
-                    silence_chunks += 1
+                    silence_cnt += 1
                 
-                # Stop if enough silence after speech
-                if started_speaking and speech_chunks >= min_speech:
-                    if silence_chunks > max_silence:
-                        self.test_mode and print("   ⏹️ Silence detected, stopping")
-                        break
+                if speaking and speech_cnt >= min_speech and silence_cnt > max_silence:
+                    print("   ⏹️ Done")
+                    break
             
-            stream2.stop_stream()
-            stream2.close()
+            rec_stream.stop_stream()
+            rec_stream.close()
             
-            # Resume wake word stream
             with self.audio_lock:
-                self._init_audio_stream()
+                self.stream.start_stream()
             
-            # Save audio file
             if frames and len(frames) >= min_speech:
-                with wave.open(output_file, "wb") as wf:
+                with wave.open(tmp.name, "wb") as wf:
                     wf.setnchannels(1)
                     wf.setsampwidth(self.pa.get_sample_size(pyaudio.paInt16))
                     wf.setframerate(SAMPLE_RATE)
                     wf.writeframes(b"".join(frames))
                 
-                if os.path.getsize(output_file) > 1000:
-                    self.test_mode and print(f"✅ Audio captured: {len(frames)} frames")
-                    return output_file
-        
+                if os.path.getsize(tmp.name) > 1000:
+                    return tmp.name
         except Exception as e:
-            print(f"❌ Recording error: {e}")
-            # Ensure wake word stream is restored
+            print(f"❌ Record error: {e}")
             with self.audio_lock:
-                self._init_audio_stream()
+                self.stream.start_stream()
         
         return None
     
-    def transcribe_audio(self, file_path: str) -> Optional[str]:
-        """Transcribe audio file using Whisper"""
-        if not file_path or not Path(file_path).exists():
+    def transcribe(self, file: str) -> Optional[str]:
+        """Convert speech to text"""
+        if not file or not Path(file).exists():
             return None
         
         try:
-            self.test_mode and print("🔄 Transcribing...")
-            result = self.whisper_model.transcribe(
-                file_path,
-                language="en",
-                fp16=False,
-                temperature=0.0,
-                condition_on_previous_text=False
-            )
-            
-            transcription = result["text"].strip().replace("[BLANK_AUDIO]", "").strip()
-            
-            if transcription and len(transcription) > 2:
-                self.test_mode and print(f"   📝 '{transcription}'")
-                return transcription
-        
+            result = self.whisper.transcribe(file, language="en", fp16=False, temperature=0.0)
+            text = result["text"].strip().replace("[BLANK_AUDIO]", "").strip()
+            if text and len(text) > 2:
+                return text
         except Exception as e:
-            print(f"❌ Transcription error: {e}")
-        
+            print(f"❌ Transcribe error: {e}")
         return None
     
-    def ask_ai(self, prompt: str) -> str:
-        """Get AI response using Ollama"""
-        prompt_clean = prompt.lower().replace('.', '').replace(',', '')
+    def ask(self, prompt: str) -> str:
+        """Get AI response"""
+        p = prompt.lower().replace('.', '').replace(',', '')
         
-        # Handle test mode commands
-        if "activate test mode" in prompt_clean:
-            self.test_mode = True
-            return "Test mode activated."
-        elif "deactivate test mode" in prompt_clean:
-            self.test_mode = False
-            return "Test mode deactivated."
-        
-        # Check custom responses
-        for trigger, response in CUSTOM_RESPONSES.items():
-            if trigger in prompt_clean:
-                return response
+        # Custom responses
+        for trigger, resp in CUSTOM_RESPONSES.items():
+            if trigger in p:
+                return resp
         
         try:
-            self.test_mode and print("🤔 Thinking...")
+            print("🤔 Thinking...")
             
-            messages = [{
+            msgs = [{
                 "role": "system",
-                "content": f"""You are {AI_NAME}, a friendly AI assistant.
-
-Personality: Warm, funny, helpful. Use casual language and wit. Keep responses 2-3 sentences unless asked for more.
-
-IMPORTANT: Be honest! If the user is wrong, correct them in a friendly way.
-
-User Info:
-{USER_INFO}
-
-Always answer accurately first, then add personality."""
+                "content": f"You are Arthur, Ronan's AI. Be casual, witty, concise (1-2 sentences).\n\n{USER_INFO}"
             }]
             
-            # Add conversation history
-            for entry in self.conversation_history:
-                messages.append({"role": "user", "content": entry["user"]})
-                messages.append({"role": "assistant", "content": entry["assistant"]})
+            for entry in list(self.history)[-3:]:
+                msgs.append({"role": "user", "content": entry["user"]})
+                msgs.append({"role": "assistant", "content": entry["assistant"]})
             
-            messages.append({"role": "user", "content": prompt})
+            msgs.append({"role": "user", "content": prompt})
             
-            # Call Ollama
             response = ollama.chat(
                 model=OLLAMA_MODEL,
-                messages=messages,
-                options={
-                    "temperature": AI_TEMPERATURE,
-                    "num_predict": AI_MAX_TOKENS,
-                }
+                messages=msgs,
+                options={"temperature": TEMP, "num_predict": MAX_TOKENS, "num_ctx": 2048}
             )
             
-            response_text = response['message']['content'].strip()
-            
-            # Update history
-            self.conversation_history.append({
-                "user": prompt,
-                "assistant": response_text
-            })
-            
-            return response_text
-        
+            reply = response['message']['content'].strip()
+            self.history.append({"user": prompt, "assistant": reply})
+            return reply
         except Exception as e:
             print(f"❌ AI error: {e}")
-            return "Hmm, something went wrong. Is Ollama running?"
+            return "Something went wrong. Is Ollama running?"
     
-    def _tts_worker(self, text: str, finished_event: threading.Event):
-        """Worker thread for TTS that can be stopped"""
-        try:
-            # Split into words for better interrupt checking
-            words = text.split()
-            chunks = []
-            current_chunk = []
-            
-            # Create chunks of ~5 words each
-            for word in words:
-                current_chunk.append(word)
-                if len(current_chunk) >= 5:
-                    chunks.append(' '.join(current_chunk))
-                    current_chunk = []
-            
-            if current_chunk:
-                chunks.append(' '.join(current_chunk))
-            
-            # Speak each chunk, checking for interrupts
-            for chunk in chunks:
-                if self.interrupt_event.is_set():
-                    break
-                
-                with self.tts_lock:
-                    self.tts_engine.say(chunk)
-                    self.tts_engine.runAndWait()
-        
-        except Exception as e:
-            self.test_mode and print(f"❌ TTS worker error: {e}")
-        
-        finally:
-            finished_event.set()
-    
-    def speak(self, text: str) -> bool:
-        """Speak text using offline pyttsx3 with interrupt support"""
-        print(f"{'💬 ' if self.test_mode else ''}{AI_NAME}: {text}")
-        
-        self.interrupt_event.clear()
-        self.speaking_flag = True
+    def speak(self, text: str):
+        """Text to speech"""
+        print(f"💬 Arthur: {text}")
+        self.speaking = True
+        self.interrupt.clear()
         
         try:
-            if self.interrupt_event.is_set():
-                return False
+            # Speak entire text at once for better flow
+            if self.interrupt.is_set():
+                print("   ⚠️ Interrupted!")
+                return
             
-            # Create event to track when TTS finishes
-            finished_event = threading.Event()
-            
-            # Start TTS in separate thread
-            tts_thread = threading.Thread(
-                target=self._tts_worker,
-                args=(text, finished_event),
-                daemon=True
-            )
-            tts_thread.start()
-            
-            # Wait for completion or interrupt
-            while not finished_event.is_set():
-                if self.interrupt_event.is_set():
-                    self.test_mode and print("   ⚠️ Speech interrupted!")
-                    # Stop the engine
-                    with self.tts_lock:
-                        try:
-                            self.tts_engine.stop()
-                        except:
-                            pass
-                    # Wait for thread to finish
-                    finished_event.wait(timeout=0.5)
-                    return False
-                time.sleep(0.05)
-            
-            return not self.interrupt_event.is_set()
-        
+            self.tts.say(text)
+            self.tts.runAndWait()
         except Exception as e:
-            print(f"❌ TTS failed: {e}")
-            return False
-        
+            print(f"❌ TTS error: {e}")
+            try:
+                self.tts.stop()
+            except:
+                pass
         finally:
-            self.speaking_flag = False
+            self.speaking = False
     
     def run(self):
-        """Main event loop"""
-        # Start wake word monitoring thread
-        threading.Thread(target=self.background_wake_monitor, daemon=True).start()
-        
-        wake_phrase = "Hey Arthur" if USE_CUSTOM_WAKE_WORD else BUILT_IN_WAKE_WORD.title()
-        print(f"🎙️ {AI_NAME} is ready. Say '{wake_phrase}' to begin.\n")
+        """Main loop"""
+        threading.Thread(target=self.monitor_wake_word, daemon=True).start()
+        print("🎙️ Say 'Hey Arthur' to begin.\n")
         
         try:
             while True:
                 try:
-                    # Block until wake word detected (no busy-wait)
-                    self.wake_word_queue.get(timeout=0.1)
+                    self.wake_queue.get(timeout=0.1)
                     
-                    # Clear any additional wake words
-                    while not self.wake_word_queue.empty():
-                        self.wake_word_queue.get_nowait()
+                    # Clear queue
+                    while not self.wake_queue.empty():
+                        self.wake_queue.get_nowait()
                     
-                    # Handle interrupt if speaking
-                    if self.speaking_flag:
-                        self.interrupt_event.set()
+                    if self.speaking:
+                        self.interrupt.set()
                         time.sleep(0.3)
                     
-                    self.interrupt_event.clear()
+                    self.interrupt.clear()
                     
-                    # Record and process audio
-                    audio_file = self.record_audio()
-                    
-                    if audio_file:
-                        command = self.transcribe_audio(audio_file)
-                        
-                        if command and len(command.strip()) > 2:
-                            print(f"{'🗣️ ' if self.test_mode else ''}You: {command}")
-                            self.speak(self.ask_ai(command))
-                            os.remove(audio_file)
+                    # Process
+                    audio = self.record()
+                    if audio:
+                        cmd = self.transcribe(audio)
+                        if cmd and len(cmd.strip()) > 2:
+                            print(f"🗣️ You: {cmd}")
+                            self.speak(self.ask(cmd))
+                            try:
+                                os.remove(audio)
+                            except:
+                                pass
                         else:
-                            self.test_mode and print("⚠️ Could not understand speech")
-                            self.speak("I didn't catch that. Could you speak louder?")
+                            self.speak("I didn't catch that.")
                     else:
-                        self.speak("I had trouble recording. Please try again.")
+                        self.speak("Recording issue. Try again.")
                     
-                    self.test_mode and print(f"\n🎙️ Ready... (Memory: {len(self.conversation_history)} exchanges)")
-                
+                    print(f"\n🎙️ Ready... ({len(self.history)} in memory)")
                 except queue.Empty:
                     continue
-        
         except KeyboardInterrupt:
-            print("\n\n🛑 Shutting down...")
-        
+            print("\n🛑 Shutting down...")
         finally:
             self.cleanup()
     
     def cleanup(self):
-        """Clean up resources"""
+        """Cleanup"""
         if self.stream:
             self.stream.stop_stream()
             self.stream.close()
@@ -444,8 +317,7 @@ Always answer accurately first, then add personality."""
         print("👋 Goodbye!")
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
-# 🚀 MAIN
+# 🚀 START
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    assistant = VoiceAssistant()
-    assistant.run()
+    VoiceAssistant().run()
