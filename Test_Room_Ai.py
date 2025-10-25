@@ -64,7 +64,7 @@ CUSTOM_RESPONSES = {
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 class VoiceAssistant:
     def __init__(self):
-        self.history = deque(maxlen=10)
+        self.history = deque(maxlen=100)
         self.wake_queue = queue.Queue()
         self.interrupt = threading.Event()
         self.speaking = False
@@ -156,6 +156,7 @@ class VoiceAssistant:
                         self.alarms.remove(alarm)
                         msg = f"⏰ ALARM! {alarm[1]}" if alarm[1] else "⏰ ALARM!"
                         print(f"\n{msg}")
+                        self.play_alarm_sound()
                         self.speak(msg)
                     
                     # Check timers
@@ -168,6 +169,7 @@ class VoiceAssistant:
                         self.timers.remove(timer)
                         msg = f"⏱️ TIMER DONE! {timer[1]}" if timer[1] else "⏱️ TIMER DONE!"
                         print(f"\n{msg}")
+                        self.play_alarm_sound()
                         self.speak(msg)
                 
                 time.sleep(1)  # Check every second
@@ -175,9 +177,28 @@ class VoiceAssistant:
                 print(f"⚠️ Alarm monitor error: {e}")
                 time.sleep(1)
     
+    def word_to_number(self, text: str) -> str:
+        """Convert word numbers to digits"""
+        word_to_num = {
+            'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5',
+            'six': '6', 'seven': '7', 'eight': '8', 'nine': '9', 'ten': '10',
+            'eleven': '11', 'twelve': '12', 'thirteen': '13', 'fourteen': '14', 'fifteen': '15',
+            'sixteen': '16', 'seventeen': '17', 'eighteen': '18', 'nineteen': '19', 'twenty': '20',
+            'twenty-one': '21', 'twenty-two': '22', 'twenty-three': '23', 'twenty-four': '24',
+            'twenty-five': '25', 'twenty-six': '26', 'twenty-seven': '27', 'twenty-eight': '28',
+            'twenty-nine': '29', 'thirty': '30', 'forty': '40', 'fifty': '50', 'sixty': '60',
+            'a': '1', 'an': '1'
+        }
+        
+        # Replace word numbers with digits
+        for word, num in word_to_num.items():
+            text = re.sub(r'\b' + word + r'\b', num, text)
+        
+        return text
+    
     def parse_time(self, text: str) -> Optional[datetime]:
-        """Parse time expressions like '7:30 AM', '15:45', '7 PM'"""
-        text = text.strip().upper()
+        """Parse time expressions like '7:30 AM', 'fifteen forty-five', '7 PM'"""
+        text = self.word_to_number(text.strip()).upper()
         
         # Try HH:MM AM/PM format
         match = re.search(r'(\d{1,2}):(\d{2})\s*(AM|PM)', text)
@@ -227,8 +248,8 @@ class VoiceAssistant:
         return None
     
     def parse_duration(self, text: str) -> Optional[int]:
-        """Parse duration in seconds from text like '5 minutes', '2 hours', '30 seconds'"""
-        text = text.lower()
+        """Parse duration in seconds from text like '5 minutes', 'two hours', '30 seconds'"""
+        text = self.word_to_number(text.lower())
         total_seconds = 0
         
         # Hours
@@ -247,6 +268,21 @@ class VoiceAssistant:
             total_seconds += int(match.group(1))
         
         return total_seconds if total_seconds > 0 else None
+    
+    def play_alarm_sound(self):
+        """Play alarm sound using system beep"""
+        try:
+            # Try to use winsound on Windows
+            import winsound
+            # Play 3 beeps
+            for _ in range(3):
+                winsound.Beep(1000, 500)  # 1000 Hz for 500ms
+                time.sleep(0.2)
+        except:
+            # Fallback: print bell character (works on most terminals)
+            for _ in range(3):
+                print('\a', end='', flush=True)
+                time.sleep(0.5)
     
     def get_weather(self) -> str:
         """Get weather information"""
@@ -274,6 +310,12 @@ class VoiceAssistant:
         """Handle special commands (alarms, timers, weather)"""
         lower = text.lower()
         
+        # Reset/Clear history
+        if any(phrase in lower for phrase in ['reset history', 'clear history', 'forget everything', 'clear memory', 'reset memory']):
+            count = len(self.history)
+            self.history.clear()
+            return f"Memory cleared! Forgot {count} conversation(s)." if count > 0 else "Memory was already empty."
+        
         # Weather
         if any(word in lower for word in ['weather', 'temperature', 'forecast', 'outside']):
             return self.get_weather()
@@ -286,7 +328,19 @@ class VoiceAssistant:
                 if 'for' in lower:
                     parts = lower.split('for', 1)
                     if len(parts) > 1:
-                        label = parts[1].strip().replace('alarm', '').strip()
+                        label_part = parts[1].strip().replace('alarm', '').strip()
+                        # Remove time-related words and number words
+                        time_words = ['am', 'pm', 'o\'clock', 'oclock']
+                        number_words = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
+                                      'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 
+                                      'eighteen', 'nineteen', 'twenty', 'thirty', 'forty', 'fifty', 'sixty',
+                                      'twenty-one', 'twenty-two', 'twenty-three', 'twenty-four', 'twenty-five',
+                                      'twenty-six', 'twenty-seven', 'twenty-eight', 'twenty-nine', 'a', 'an']
+                        for word in time_words + number_words:
+                            label_part = re.sub(r'\b' + word + r'\b', '', label_part, flags=re.IGNORECASE)
+                        # Remove digits and colons
+                        label_part = re.sub(r'[\d:]+', '', label_part)
+                        label = label_part.strip().strip(',').strip()
                 
                 with self.alarm_lock:
                     self.alarms.append((alarm_time, label))
@@ -321,7 +375,6 @@ class VoiceAssistant:
             if alarm_time and 'all' not in lower:
                 with self.alarm_lock:
                     # Find and remove alarm matching the time
-                    removed = False
                     for i, (atime, label) in enumerate(self.alarms):
                         if atime.hour == alarm_time.hour and atime.minute == alarm_time.minute:
                             self.alarms.pop(i)
@@ -346,8 +399,19 @@ class VoiceAssistant:
                     if len(parts) > 1:
                         # Remove time-related words to get label
                         label_part = parts[-1]
-                        for word in ['minutes', 'minute', 'min', 'hours', 'hour', 'hr', 'seconds', 'second', 'sec', 'timer']:
-                            label_part = label_part.replace(word, '')
+                        # Remove time words
+                        time_words = ['minutes', 'minute', 'min', 'hours', 'hour', 'hr', 'seconds', 'second', 'sec', 'timer']
+                        # Remove number words
+                        number_words = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
+                                      'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 
+                                      'eighteen', 'nineteen', 'twenty', 'thirty', 'forty', 'fifty', 'sixty',
+                                      'twenty-one', 'twenty-two', 'twenty-three', 'twenty-four', 'twenty-five',
+                                      'twenty-six', 'twenty-seven', 'twenty-eight', 'twenty-nine', 'a', 'an']
+                        # Remove all time and number words
+                        for word in time_words + number_words:
+                            label_part = re.sub(r'\b' + word + r'\b', '', label_part, flags=re.IGNORECASE)
+                        # Also remove digits
+                        label_part = re.sub(r'\b\d+\b', '', label_part)
                         label = label_part.strip().strip(',').strip()
                 
                 end_time = datetime.now() + timedelta(seconds=duration)
@@ -604,7 +668,7 @@ class VoiceAssistant:
     def run_text_mode(self):
         """Text-only interaction loop"""
         print("💬 Type your messages below (Ctrl+C to exit)\n")
-        print("📝 Commands: 'set alarm for 7:30 AM', 'set timer for 5 minutes', 'what's the weather'\n")
+        print("📝 Commands: 'set alarm for 7:30 AM', 'set timer for 5 minutes', 'what's the weather', 'clear history'\n")
         
         try:
             while True:
