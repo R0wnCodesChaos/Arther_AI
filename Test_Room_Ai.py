@@ -1,18 +1,25 @@
 import pvporcupine, pyaudio, struct, whisper, wave, os, tempfile, threading, time, numpy as np
-import ollama, pyttsx3, queue
+import ollama, pyttsx3, queue, requests, re
 from pathlib import Path
 from typing import Optional
 from collections import deque
+from datetime import datetime, timedelta
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 # ⚙️ CONFIG
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
+VOICE_MODE = False  # Set to False for text-only mode
+
 ACCESS_KEY = os.getenv("PORCUPINE_ACCESS_KEY")
 WAKE_WORD_PATH = "Hey-Arthur_en_windows_v3_0_0.ppn"
 MIC_INDEX, SAMPLE_RATE, CHUNK = 1, 16000, 512
 SILENCE_THRESH, SILENCE_TIME, MIN_SPEECH = 500, 1.5, 0.3
 OLLAMA_MODEL, MAX_TOKENS, TEMP = "llama3.2:3b", 150, 0.7
 VOICE_RATE = 180
+
+# Weather API (OpenWeatherMap - free tier)
+WEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")  # Get free key at openweathermap.org
+WEATHER_LOCATION = "Noels Pond,CA"  # Ronan's location
 
 USER_INFO = """Name: Ronan
 Age: 13
@@ -62,6 +69,12 @@ class VoiceAssistant:
         self.interrupt = threading.Event()
         self.speaking = False
         self.audio_lock = threading.Lock()
+        self.voice_mode = VOICE_MODE
+        
+        # Alarms & Timers
+        self.alarms = []  # List of (datetime, label) tuples
+        self.timers = []  # List of (end_time, label) tuples
+        self.alarm_lock = threading.Lock()
         
         # Check Ollama
         try:
@@ -71,28 +84,38 @@ class VoiceAssistant:
             print("⚠️ Start Ollama with: ollama serve")
             exit(1)
         
-        # Porcupine
-        self.porcupine = pvporcupine.create(
-            access_key=ACCESS_KEY,
-            keyword_paths=[WAKE_WORD_PATH]
-        )
+        if self.voice_mode:
+            # Porcupine
+            self.porcupine = pvporcupine.create(
+                access_key=ACCESS_KEY,
+                keyword_paths=[WAKE_WORD_PATH]
+            )
+            
+            # Whisper
+            print("🔄 Loading Whisper...")
+            self.whisper = whisper.load_model("tiny")
+            
+            # Audio
+            self.pa = pyaudio.PyAudio()
+            self.stream = self.pa.open(
+                rate=self.porcupine.sample_rate,
+                channels=1,
+                format=pyaudio.paInt16,
+                input=True,
+                frames_per_buffer=self.porcupine.frame_length,
+                input_device_index=MIC_INDEX
+            )
+            
+            print("✅ Arthur ready (Voice Mode)!")
+        else:
+            self.porcupine = None
+            self.whisper = None
+            self.pa = None
+            self.stream = None
+            print("✅ Arthur ready (Text Mode)!")
         
-        # Whisper
-        print("🔄 Loading Whisper...")
-        self.whisper = whisper.load_model("tiny")
-        
-        # Audio
-        self.pa = pyaudio.PyAudio()
-        self.stream = self.pa.open(
-            rate=self.porcupine.sample_rate,
-            channels=1,
-            format=pyaudio.paInt16,
-            input=True,
-            frames_per_buffer=self.porcupine.frame_length,
-            input_device_index=MIC_INDEX
-        )
-        
-        print("✅ Arthur ready!")
+        # Start alarm/timer monitor
+        threading.Thread(target=self.monitor_alarms_timers, daemon=True).start()
     
     def monitor_wake_word(self):
         """Background wake word detection"""
@@ -115,6 +138,309 @@ class VoiceAssistant:
             except Exception as e:
                 print(f"⚠️ {e}")
                 time.sleep(0.1)
+    
+    def monitor_alarms_timers(self):
+        """Background alarm/timer checker"""
+        while True:
+            try:
+                now = datetime.now()
+                
+                with self.alarm_lock:
+                    # Check alarms
+                    triggered_alarms = []
+                    for alarm_time, label in self.alarms:
+                        if now >= alarm_time:
+                            triggered_alarms.append((alarm_time, label))
+                    
+                    for alarm in triggered_alarms:
+                        self.alarms.remove(alarm)
+                        msg = f"⏰ ALARM! {alarm[1]}" if alarm[1] else "⏰ ALARM!"
+                        print(f"\n{msg}")
+                        self.speak(msg)
+                    
+                    # Check timers
+                    triggered_timers = []
+                    for end_time, label in self.timers:
+                        if now >= end_time:
+                            triggered_timers.append((end_time, label))
+                    
+                    for timer in triggered_timers:
+                        self.timers.remove(timer)
+                        msg = f"⏱️ TIMER DONE! {timer[1]}" if timer[1] else "⏱️ TIMER DONE!"
+                        print(f"\n{msg}")
+                        self.speak(msg)
+                
+                time.sleep(1)  # Check every second
+            except Exception as e:
+                print(f"⚠️ Alarm monitor error: {e}")
+                time.sleep(1)
+    
+    def parse_time(self, text: str) -> Optional[datetime]:
+        """Parse time expressions like '7:30 AM', '15:45', '7 PM'"""
+        text = text.strip().upper()
+        
+        # Try HH:MM AM/PM format
+        match = re.search(r'(\d{1,2}):(\d{2})\s*(AM|PM)', text)
+        if match:
+            hour, minute, period = match.groups()
+            hour = int(hour)
+            minute = int(minute)
+            
+            if period == 'PM' and hour != 12:
+                hour += 12
+            elif period == 'AM' and hour == 12:
+                hour = 0
+            
+            target = datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if target <= datetime.now():
+                target += timedelta(days=1)
+            return target
+        
+        # Try HH AM/PM format
+        match = re.search(r'(\d{1,2})\s*(AM|PM)', text)
+        if match:
+            hour, period = match.groups()
+            hour = int(hour)
+            
+            if period == 'PM' and hour != 12:
+                hour += 12
+            elif period == 'AM' and hour == 12:
+                hour = 0
+            
+            target = datetime.now().replace(hour=hour, minute=0, second=0, microsecond=0)
+            if target <= datetime.now():
+                target += timedelta(days=1)
+            return target
+        
+        # Try 24-hour format HH:MM
+        match = re.search(r'(\d{1,2}):(\d{2})', text)
+        if match:
+            hour, minute = match.groups()
+            hour = int(hour)
+            minute = int(minute)
+            
+            target = datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if target <= datetime.now():
+                target += timedelta(days=1)
+            return target
+        
+        return None
+    
+    def parse_duration(self, text: str) -> Optional[int]:
+        """Parse duration in seconds from text like '5 minutes', '2 hours', '30 seconds'"""
+        text = text.lower()
+        total_seconds = 0
+        
+        # Hours
+        match = re.search(r'(\d+)\s*(?:hour|hr)s?', text)
+        if match:
+            total_seconds += int(match.group(1)) * 3600
+        
+        # Minutes
+        match = re.search(r'(\d+)\s*(?:minute|min)s?', text)
+        if match:
+            total_seconds += int(match.group(1)) * 60
+        
+        # Seconds
+        match = re.search(r'(\d+)\s*(?:second|sec)s?', text)
+        if match:
+            total_seconds += int(match.group(1))
+        
+        return total_seconds if total_seconds > 0 else None
+    
+    def get_weather(self) -> str:
+        """Get weather information"""
+        if not WEATHER_API_KEY:
+            return "Weather API key not set. Get a free key at openweathermap.org and set OPENWEATHER_API_KEY environment variable."
+        
+        try:
+            url = f"http://api.openweathermap.org/data/2.5/weather?q={WEATHER_LOCATION}&appid={WEATHER_API_KEY}&units=metric"
+            response = requests.get(url, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                temp = data['main']['temp']
+                feels = data['main']['feels_like']
+                desc = data['weather'][0]['description']
+                humidity = data['main']['humidity']
+                
+                return f"It's {temp:.0f}°C in Noels Pond, feels like {feels:.0f}°C. {desc.capitalize()}. Humidity {humidity}%."
+            else:
+                return "Couldn't fetch weather right now. Check your API key or internet connection."
+        except Exception as e:
+            return f"Weather check failed: {str(e)}"
+    
+    def handle_command(self, text: str) -> Optional[str]:
+        """Handle special commands (alarms, timers, weather)"""
+        lower = text.lower()
+        
+        # Weather
+        if any(word in lower for word in ['weather', 'temperature', 'forecast', 'outside']):
+            return self.get_weather()
+        
+        # Set alarm
+        if 'alarm' in lower and ('set' in lower or 'create' in lower or 'for' in lower or 'at' in lower):
+            alarm_time = self.parse_time(text)
+            if alarm_time:
+                label = ""
+                if 'for' in lower:
+                    parts = lower.split('for', 1)
+                    if len(parts) > 1:
+                        label = parts[1].strip().replace('alarm', '').strip()
+                
+                with self.alarm_lock:
+                    self.alarms.append((alarm_time, label))
+                
+                time_str = alarm_time.strftime("%I:%M %p")
+                if label:
+                    return f"Alarm set for {time_str} - {label}"
+                return f"Alarm set for {time_str}"
+            else:
+                return "Couldn't parse that time. Try like '7:30 AM' or '3 PM'"
+        
+        # List alarms
+        if 'alarm' in lower and ('list' in lower or 'show' in lower or 'what' in lower):
+            with self.alarm_lock:
+                if not self.alarms:
+                    return "No alarms set"
+                
+                msg = f"You have {len(self.alarms)} alarm(s): "
+                alarm_list = []
+                for alarm_time, label in sorted(self.alarms):
+                    time_str = alarm_time.strftime("%I:%M %p")
+                    if label:
+                        alarm_list.append(f"{time_str} ({label})")
+                    else:
+                        alarm_list.append(time_str)
+                return msg + ", ".join(alarm_list)
+        
+        # Clear alarms
+        if 'alarm' in lower and ('clear' in lower or 'delete' in lower or 'remove' in lower or 'cancel' in lower):
+            # Check if user wants to clear a specific alarm
+            alarm_time = self.parse_time(text)
+            if alarm_time and 'all' not in lower:
+                with self.alarm_lock:
+                    # Find and remove alarm matching the time
+                    removed = False
+                    for i, (atime, label) in enumerate(self.alarms):
+                        if atime.hour == alarm_time.hour and atime.minute == alarm_time.minute:
+                            self.alarms.pop(i)
+                            time_str = atime.strftime("%I:%M %p")
+                            return f"Cancelled alarm at {time_str}"
+                    return "No alarm found at that time"
+            
+            # Clear all alarms
+            with self.alarm_lock:
+                count = len(self.alarms)
+                self.alarms.clear()
+                return f"Cleared {count} alarm(s)" if count > 0 else "No alarms to clear"
+        
+        # Set timer
+        if 'timer' in lower and ('set' in lower or 'create' in lower or 'for' in lower or 'start' in lower):
+            duration = self.parse_duration(text)
+            if duration:
+                label = ""
+                if 'for' in lower:
+                    # Extract label after 'for'
+                    parts = text.lower().split('for')
+                    if len(parts) > 1:
+                        # Remove time-related words to get label
+                        label_part = parts[-1]
+                        for word in ['minutes', 'minute', 'min', 'hours', 'hour', 'hr', 'seconds', 'second', 'sec', 'timer']:
+                            label_part = label_part.replace(word, '')
+                        label = label_part.strip().strip(',').strip()
+                
+                end_time = datetime.now() + timedelta(seconds=duration)
+                
+                with self.alarm_lock:
+                    self.timers.append((end_time, label))
+                
+                # Format duration nicely
+                hours = duration // 3600
+                minutes = (duration % 3600) // 60
+                seconds = duration % 60
+                
+                time_parts = []
+                if hours > 0:
+                    time_parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+                if minutes > 0:
+                    time_parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+                if seconds > 0:
+                    time_parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+                
+                duration_str = " ".join(time_parts)
+                
+                if label:
+                    return f"Timer set for {duration_str} - {label}"
+                return f"Timer set for {duration_str}"
+            else:
+                return "Couldn't parse that duration. Try like '5 minutes' or '2 hours 30 minutes'"
+        
+        # List timers
+        if 'timer' in lower and ('list' in lower or 'show' in lower or 'what' in lower or 'check' in lower):
+            with self.alarm_lock:
+                if not self.timers:
+                    return "No timers running"
+                
+                msg = f"You have {len(self.timers)} timer(s): "
+                timer_list = []
+                for end_time, label in sorted(self.timers):
+                    remaining = (end_time - datetime.now()).total_seconds()
+                    if remaining > 0:
+                        mins = int(remaining // 60)
+                        secs = int(remaining % 60)
+                        time_str = f"{mins}m {secs}s"
+                        if label:
+                            timer_list.append(f"{time_str} ({label})")
+                        else:
+                            timer_list.append(time_str)
+                return msg + ", ".join(timer_list)
+        
+        # Clear timers
+        if 'timer' in lower and ('clear' in lower or 'delete' in lower or 'remove' in lower or 'cancel' in lower or 'stop' in lower):
+            # Check if user specified a number (e.g., "cancel timer 1" or "stop the first timer")
+            match = re.search(r'(?:timer\s*)?(?:number\s*)?(\d+|first|second|third|last)', lower)
+            if match and 'all' not in lower:
+                position_str = match.group(1)
+                
+                # Convert position to index
+                position_map = {'first': 0, 'second': 1, 'third': 2, 'last': -1}
+                if position_str in position_map:
+                    index = position_map[position_str]
+                else:
+                    index = int(position_str) - 1  # Convert to 0-based index
+                
+                with self.alarm_lock:
+                    if not self.timers:
+                        return "No timers to cancel"
+                    
+                    # Sort timers by end time for consistent ordering
+                    sorted_timers = sorted(self.timers)
+                    
+                    if index < 0:
+                        index = len(sorted_timers) + index
+                    
+                    if 0 <= index < len(sorted_timers):
+                        timer_to_remove = sorted_timers[index]
+                        self.timers.remove(timer_to_remove)
+                        
+                        remaining = (timer_to_remove[0] - datetime.now()).total_seconds()
+                        mins = int(remaining // 60)
+                        secs = int(remaining % 60)
+                        
+                        if timer_to_remove[1]:
+                            return f"Cancelled timer: {timer_to_remove[1]} ({mins}m {secs}s remaining)"
+                        return f"Cancelled timer with {mins}m {secs}s remaining"
+                    else:
+                        return f"Timer number {index + 1} doesn't exist"
+            
+            # Clear all timers
+            with self.alarm_lock:
+                count = len(self.timers)
+                self.timers.clear()
+                return f"Cleared {count} timer(s)" if count > 0 else "No timers to clear"
+        
+        return None
     
     def record(self) -> Optional[str]:
         """Record audio until silence"""
@@ -197,6 +523,11 @@ class VoiceAssistant:
     
     def ask(self, prompt: str) -> str:
         """Get AI response"""
+        # Check for special commands first
+        command_response = self.handle_command(prompt)
+        if command_response:
+            return command_response
+        
         p = prompt.lower().replace('.', '').replace(',', '')
         
         # Custom responses
@@ -234,6 +565,10 @@ class VoiceAssistant:
     def speak(self, text: str):
         """Text to speech - Fixed for Windows"""
         print(f"💬 Arthur: {text}")
+        
+        if not self.voice_mode:
+            return
+        
         self.speaking = True
         self.interrupt.clear()
         
@@ -266,8 +601,34 @@ class VoiceAssistant:
         finally:
             self.speaking = False
     
-    def run(self):
-        """Main loop"""
+    def run_text_mode(self):
+        """Text-only interaction loop"""
+        print("💬 Type your messages below (Ctrl+C to exit)\n")
+        print("📝 Commands: 'set alarm for 7:30 AM', 'set timer for 5 minutes', 'what's the weather'\n")
+        
+        try:
+            while True:
+                try:
+                    user_input = input("You: ").strip()
+                    
+                    if not user_input:
+                        continue
+                    
+                    if user_input.lower() in ['exit', 'quit', 'bye']:
+                        print("👋 Goodbye!")
+                        break
+                    
+                    response = self.ask(user_input)
+                    self.speak(response)
+                    print(f"({len(self.history)} in memory)\n")
+                    
+                except EOFError:
+                    break
+        except KeyboardInterrupt:
+            print("\n🛑 Shutting down...")
+    
+    def run_voice_mode(self):
+        """Voice interaction loop"""
         threading.Thread(target=self.monitor_wake_word, daemon=True).start()
         print("🎙️ Say 'Hey Arthur' to begin.\n")
         
@@ -307,16 +668,26 @@ class VoiceAssistant:
                     continue
         except KeyboardInterrupt:
             print("\n🛑 Shutting down...")
+    
+    def run(self):
+        """Main loop - chooses mode based on VOICE_MODE setting"""
+        try:
+            if self.voice_mode:
+                self.run_voice_mode()
+            else:
+                self.run_text_mode()
         finally:
             self.cleanup()
     
     def cleanup(self):
         """Cleanup"""
-        if self.stream:
+        if self.voice_mode and self.stream:
             self.stream.stop_stream()
             self.stream.close()
-        self.pa.terminate()
-        self.porcupine.delete()
+        if self.pa:
+            self.pa.terminate()
+        if self.porcupine:
+            self.porcupine.delete()
         print("👋 Goodbye!")
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
