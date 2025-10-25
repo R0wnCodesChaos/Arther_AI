@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 # ⚙️ CONFIG
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
-VOICE_MODE = False  # Set to False for text-only mode
+VOICE_MODE = True  # Set to False for text-only mode
 
 ACCESS_KEY = os.getenv("PORCUPINE_ACCESS_KEY")
 WAKE_WORD_PATH = "Hey-Arthur_en_windows_v3_0_0.ppn"
