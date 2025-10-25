@@ -19,19 +19,19 @@ Age: 13
 Location: Noels Pond, Newfoundland, Canada
 
 Personality:
-Smart-ass, adventurous, sarcastic, and funny. Dark sense of humor, usually jokes around and doesn’t take things too seriously. Likes when Arthur talks like a friend — casual, witty, and not robotic.
+Smart-ass, adventurous, sarcastic, and funny. Dark sense of humor, usually jokes around and doesn't take things too seriously. Likes when Arthur talks like a friend — casual, witty, and not robotic.
 
 Interests:
 Loves gaming (Grounded 2, Roblox, Trailmakers) and tech. Excited for Subnautica 2 and the next Grounded update. Watches mostly gaming and tech content on YouTube.
 
 Media & Fandoms:
-Favorite shows are Stranger Things and Dark (“that cool German show”). Doesn’t really have a favorite character but enjoys mysterious or sci-fi vibes.
+Favorite shows are Stranger Things and Dark ("that cool German show"). Doesn't really have a favorite character but enjoys mysterious or sci-fi vibes.
 
 School & Learning:
 Enjoys gym, math, tech, and ELA. Tolerates social studies, French, and religion. Thinks health class is boring.
 
 Sports & Activities:
-Does Taekwondo during the school season, swims all year, and goes skiing in the winter when there’s snow.
+Does Taekwondo during the school season, swims all year, and goes skiing in the winter when there's snow.
 
 Setup:
 Ryzen 5 5600X (6 core), 16GB RAM, 970 EVO Plus 1TB SSD, RX 6600 GPU, dual monitors, mouse, keyboard, and a Soomfon stream controller.
@@ -46,7 +46,6 @@ Pets:
 Friends & Family:
 Has two close friends (Alex and Matheo, both male). Two siblings (Isaac — brother, Freya — sister). Calls parents simply Mom and Dad.
 """
-
 
 CUSTOM_RESPONSES = {
     "brother iq": "Your brother's IQ is lower than a rock. Just kidding!",
@@ -71,14 +70,6 @@ class VoiceAssistant:
         except:
             print("⚠️ Start Ollama with: ollama serve")
             exit(1)
-        
-        # TTS
-        self.tts = pyttsx3.init()
-        voices = self.tts.getProperty('voices')
-        if voices:
-            self.tts.setProperty('voice', voices[0].id)
-        self.tts.setProperty('rate', VOICE_RATE)
-        self.tts.setProperty('volume', 1.0)
         
         # Porcupine
         self.porcupine = pvporcupine.create(
@@ -241,25 +232,37 @@ class VoiceAssistant:
             return "Something went wrong. Is Ollama running?"
     
     def speak(self, text: str):
-        """Text to speech"""
+        """Text to speech - Fixed for Windows"""
         print(f"💬 Arthur: {text}")
         self.speaking = True
         self.interrupt.clear()
         
         try:
-            # Speak entire text at once for better flow
+            # Create fresh TTS engine to avoid state issues on Windows
+            engine = pyttsx3.init()
+            engine.setProperty('rate', VOICE_RATE)
+            engine.setProperty('volume', 1.0)
+            
+            voices = engine.getProperty('voices')
+            if voices:
+                engine.setProperty('voice', voices[0].id)
+            
+            # Check for interrupt
             if self.interrupt.is_set():
                 print("   ⚠️ Interrupted!")
+                engine.stop()
+                del engine
                 return
             
-            self.tts.say(text)
-            self.tts.runAndWait()
+            # Speak the full text
+            engine.say(text)
+            engine.runAndWait()
+            
+            # Clean up engine
+            del engine
+            
         except Exception as e:
             print(f"❌ TTS error: {e}")
-            try:
-                self.tts.stop()
-            except:
-                pass
         finally:
             self.speaking = False
     
