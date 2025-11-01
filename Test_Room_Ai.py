@@ -148,18 +148,41 @@ class VoiceAssistant:
     def _check_openai(self) -> bool:
         """Check if OpenAI API is accessible"""
         try:
-            # Try to make a simple request to OpenAI
+            # First do a quick internet check
+            test_response = requests.get("https://www.google.com", timeout=3)
+            if test_response.status_code != 200:
+                return False
+            
+            # Then check OpenAI API
             headers = {
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
                 "Content-Type": "application/json"
             }
-            response = requests.get(
-                "https://api.openai.com/v1/models",
+            
+            # Use a simpler endpoint that's faster
+            data = {
+                "model": OPENAI_MODEL,
+                "messages": [{"role": "user", "content": "test"}],
+                "max_tokens": 5
+            }
+            
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
                 headers=headers,
-                timeout=5
+                json=data,
+                timeout=10
             )
-            return response.status_code == 200
-        except:
+            
+            # Accept both 200 (success) and 401 (invalid key but API is reachable)
+            return response.status_code in [200, 401]
+        except requests.exceptions.Timeout:
+            print("   (Timeout checking OpenAI API)")
+            return False
+        except requests.exceptions.ConnectionError:
+            print("   (No internet connection)")
+            return False
+        except Exception as e:
+            print(f"   (Error: {e})")
             return False
     
     def _check_ollama(self) -> bool:
@@ -720,3 +743,159 @@ class VoiceAssistant:
         except Exception as e:
             print(f"❌ Ollama error: {e}")
             return "Something went wrong with Ollama. Is it running?"
+    
+    def ask(self, prompt: str) -> str:
+        """Get AI response"""
+        # Check for special commands first
+        command_response = self.handle_command(prompt)
+        if command_response:
+            return command_response
+        
+        p = prompt.lower().replace('.', '').replace(',', '')
+        
+        # Custom responses
+        for trigger, resp in CUSTOM_RESPONSES.items():
+            if trigger in p:
+                return resp
+        
+        print(f"🤔 Thinking... ({self.ai_mode})")
+        
+        # Route to appropriate AI
+        if self.use_openai:
+            return self.ask_openai(prompt)
+        else:
+            return self.ask_ollama(prompt)
+    
+    def speak(self, text: str):
+        """Text to speech - Fixed for Windows"""
+        print(f"💬 Arthur: {text}")
+        
+        if not self.voice_mode:
+            return
+        
+        self.speaking = True
+        self.interrupt.clear()
+        
+        try:
+            # Create fresh TTS engine to avoid state issues on Windows
+            engine = pyttsx3.init()
+            engine.setProperty('rate', VOICE_RATE)
+            engine.setProperty('volume', 1.0)
+            
+            voices = engine.getProperty('voices')
+            if voices:
+                engine.setProperty('voice', voices[0].id)
+            
+            # Check for interrupt
+            if self.interrupt.is_set():
+                print("   ⚠️ Interrupted!")
+                engine.stop()
+                del engine
+                return
+            
+            # Speak the full text
+            engine.say(text)
+            engine.runAndWait()
+            
+            # Clean up engine
+            del engine
+            
+        except Exception as e:
+            print(f"❌ TTS error: {e}")
+        finally:
+            self.speaking = False
+    
+    def run_text_mode(self):
+        """Text-only interaction loop"""
+        print("💬 Type your messages below (Ctrl+C to exit)\n")
+        print("📝 Commands: 'set alarm for 7:30 AM', 'set timer for 5 minutes', 'what's the weather', 'clear history'\n")
+        
+        try:
+            while True:
+                try:
+                    user_input = input("You: ").strip()
+                    
+                    if not user_input:
+                        continue
+                    
+                    if user_input.lower() in ['exit', 'quit', 'bye']:
+                        print("👋 Goodbye!")
+                        break
+                    
+                    response = self.ask(user_input)
+                    self.speak(response)
+                    print(f"({len(self.history)} in memory)\n")
+                    
+                except EOFError:
+                    break
+        except KeyboardInterrupt:
+            print("\n🛑 Shutting down...")
+    
+    def run_voice_mode(self):
+        """Voice interaction loop"""
+        threading.Thread(target=self.monitor_wake_word, daemon=True).start()
+        print("🎙️ Say 'Hey Arthur' to begin.\n")
+        
+        try:
+            while True:
+                try:
+                    self.wake_queue.get(timeout=0.1)
+                    
+                    # Clear queue
+                    while not self.wake_queue.empty():
+                        self.wake_queue.get_nowait()
+                    
+                    if self.speaking:
+                        self.interrupt.set()
+                        time.sleep(0.3)
+                    
+                    self.interrupt.clear()
+                    
+                    # Process
+                    audio = self.record()
+                    if audio:
+                        cmd = self.transcribe(audio)
+                        if cmd and len(cmd.strip()) > 2:
+                            print(f"🗣️ You: {cmd}")
+                            self.speak(self.ask(cmd))
+                            try:
+                                os.remove(audio)
+                            except:
+                                pass
+                        else:
+                            self.speak("I didn't catch that.")
+                    else:
+                        self.speak("Recording issue. Try again.")
+                    
+                    print(f"\n🎙️ Ready... ({len(self.history)} in memory)")
+                except queue.Empty:
+                    continue
+        except KeyboardInterrupt:
+            print("\n🛑 Shutting down...")
+    
+    def run(self):
+        """Main loop - chooses mode based on VOICE_MODE setting"""
+        try:
+            if self.voice_mode:
+                self.run_voice_mode()
+            else:
+                self.run_text_mode()
+        finally:
+            self.cleanup()
+    
+    def cleanup(self):
+        """Cleanup"""
+        if self.voice_mode and self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+        if self.pa:
+            self.pa.terminate()
+        if self.porcupine:
+            self.porcupine.delete()
+        print("👋 Goodbye!")
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# 🚀 START
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    VoiceAssistant().run()
