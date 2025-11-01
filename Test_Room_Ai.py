@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 # ⚙️ CONFIG
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
-VOICE_MODE = True  # Set to False for text-only mode
+VOICE_MODE = False  # Set to False for text-only mode
 
 ACCESS_KEY = os.getenv("PORCUPINE_ACCESS_KEY")
 WAKE_WORD_PATH = "Hey-Arthur_en_windows_v3_0_0.ppn"
@@ -16,6 +16,10 @@ MIC_INDEX, SAMPLE_RATE, CHUNK = 1, 16000, 512
 SILENCE_THRESH, SILENCE_TIME, MIN_SPEECH = 500, 1.5, 0.3
 OLLAMA_MODEL, MAX_TOKENS, TEMP = "llama3.2:3b", 150, 0.7
 VOICE_RATE = 180
+
+# OpenAI Configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # Set your OpenAI API key as environment variable
+OPENAI_MODEL = "gpt-4o-mini"
 
 # Weather API (OpenWeatherMap - free tier)
 WEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")  # Get free key at openweathermap.org
@@ -71,18 +75,17 @@ class VoiceAssistant:
         self.audio_lock = threading.Lock()
         self.voice_mode = VOICE_MODE
         
+        # AI Mode Selection
+        self.use_openai = False
+        self.ai_mode = "Checking..."
+        
         # Alarms & Timers
         self.alarms = []  # List of (datetime, label) tuples
         self.timers = []  # List of (end_time, label) tuples
         self.alarm_lock = threading.Lock()
         
-        # Check Ollama
-        try:
-            ollama.list()
-            print(f"✅ Ollama: {OLLAMA_MODEL}")
-        except:
-            print("⚠️ Start Ollama with: ollama serve")
-            exit(1)
+        # Check AI availability
+        self._setup_ai()
         
         if self.voice_mode:
             # Porcupine
@@ -106,16 +109,66 @@ class VoiceAssistant:
                 input_device_index=MIC_INDEX
             )
             
-            print("✅ Arthur ready (Voice Mode)!")
+            print(f"✅ Arthur ready (Voice Mode) - Using {self.ai_mode}!")
         else:
             self.porcupine = None
             self.whisper = None
             self.pa = None
             self.stream = None
-            print("✅ Arthur ready (Text Mode)!")
+            print(f"✅ Arthur ready (Text Mode) - Using {self.ai_mode}!")
         
         # Start alarm/timer monitor
         threading.Thread(target=self.monitor_alarms_timers, daemon=True).start()
+    
+    def _setup_ai(self):
+        """Check internet and AI availability, prioritize OpenAI if available"""
+        # First check if OpenAI is available (requires API key and internet)
+        if OPENAI_API_KEY:
+            if self._check_openai():
+                self.use_openai = True
+                self.ai_mode = "OpenAI GPT-4o-mini (Online)"
+                print("✅ OpenAI: Connected")
+                return
+            else:
+                print("⚠️ OpenAI: Not available (no internet or invalid API key)")
+        else:
+            print("⚠️ OpenAI: API key not set")
+        
+        # Fall back to Ollama
+        if self._check_ollama():
+            self.use_openai = False
+            self.ai_mode = "Ollama (Offline)"
+            print(f"✅ Ollama: {OLLAMA_MODEL}")
+        else:
+            print("❌ Error: Neither OpenAI nor Ollama available!")
+            print("   - For OpenAI: Set OPENAI_API_KEY environment variable and connect to internet")
+            print("   - For Ollama: Start with 'ollama serve'")
+            exit(1)
+    
+    def _check_openai(self) -> bool:
+        """Check if OpenAI API is accessible"""
+        try:
+            # Try to make a simple request to OpenAI
+            headers = {
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            response = requests.get(
+                "https://api.openai.com/v1/models",
+                headers=headers,
+                timeout=5
+            )
+            return response.status_code == 200
+        except:
+            return False
+    
+    def _check_ollama(self) -> bool:
+        """Check if Ollama is running"""
+        try:
+            ollama.list()
+            return True
+        except:
+            return False
     
     def monitor_wake_word(self):
         """Background wake word detection"""
@@ -585,23 +638,65 @@ class VoiceAssistant:
             print(f"❌ Transcribe error: {e}")
         return None
     
-    def ask(self, prompt: str) -> str:
-        """Get AI response"""
-        # Check for special commands first
-        command_response = self.handle_command(prompt)
-        if command_response:
-            return command_response
-        
-        p = prompt.lower().replace('.', '').replace(',', '')
-        
-        # Custom responses
-        for trigger, resp in CUSTOM_RESPONSES.items():
-            if trigger in p:
-                return resp
-        
+    def ask_openai(self, prompt: str) -> str:
+        """Get response from OpenAI"""
         try:
-            print("🤔 Thinking...")
+            msgs = [{
+                "role": "system",
+                "content": f"You are Arthur, Ronan's AI. Be casual, witty, concise (1-2 sentences).\n\n{USER_INFO}"
+            }]
             
+            for entry in list(self.history)[-3:]:
+                msgs.append({"role": "user", "content": entry["user"]})
+                msgs.append({"role": "assistant", "content": entry["assistant"]})
+            
+            msgs.append({"role": "user", "content": prompt})
+            
+            headers = {
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "model": OPENAI_MODEL,
+                "messages": msgs,
+                "max_tokens": MAX_TOKENS,
+                "temperature": TEMP
+            }
+            
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=data,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                reply = response.json()['choices'][0]['message']['content'].strip()
+                self.history.append({"user": prompt, "assistant": reply})
+                return reply
+            else:
+                print(f"❌ OpenAI error: {response.status_code}")
+                # Fall back to Ollama if OpenAI fails
+                if self._check_ollama():
+                    print("   Falling back to Ollama...")
+                    self.use_openai = False
+                    self.ai_mode = "Ollama (Fallback)"
+                    return self.ask_ollama(prompt)
+                return "OpenAI request failed. Check your connection or API key."
+        except Exception as e:
+            print(f"❌ OpenAI error: {e}")
+            # Fall back to Ollama if OpenAI fails
+            if self._check_ollama():
+                print("   Falling back to Ollama...")
+                self.use_openai = False
+                self.ai_mode = "Ollama (Fallback)"
+                return self.ask_ollama(prompt)
+            return "Something went wrong with OpenAI."
+    
+    def ask_ollama(self, prompt: str) -> str:
+        """Get response from Ollama"""
+        try:
             msgs = [{
                 "role": "system",
                 "content": f"You are Arthur, Ronan's AI. Be casual, witty, concise (1-2 sentences).\n\n{USER_INFO}"
@@ -623,139 +718,5 @@ class VoiceAssistant:
             self.history.append({"user": prompt, "assistant": reply})
             return reply
         except Exception as e:
-            print(f"❌ AI error: {e}")
-            return "Something went wrong. Is Ollama running?"
-    
-    def speak(self, text: str):
-        """Text to speech - Fixed for Windows"""
-        print(f"💬 Arthur: {text}")
-        
-        if not self.voice_mode:
-            return
-        
-        self.speaking = True
-        self.interrupt.clear()
-        
-        try:
-            # Create fresh TTS engine to avoid state issues on Windows
-            engine = pyttsx3.init()
-            engine.setProperty('rate', VOICE_RATE)
-            engine.setProperty('volume', 1.0)
-            
-            voices = engine.getProperty('voices')
-            if voices:
-                engine.setProperty('voice', voices[0].id)
-            
-            # Check for interrupt
-            if self.interrupt.is_set():
-                print("   ⚠️ Interrupted!")
-                engine.stop()
-                del engine
-                return
-            
-            # Speak the full text
-            engine.say(text)
-            engine.runAndWait()
-            
-            # Clean up engine
-            del engine
-            
-        except Exception as e:
-            print(f"❌ TTS error: {e}")
-        finally:
-            self.speaking = False
-    
-    def run_text_mode(self):
-        """Text-only interaction loop"""
-        print("💬 Type your messages below (Ctrl+C to exit)\n")
-        print("📝 Commands: 'set alarm for 7:30 AM', 'set timer for 5 minutes', 'what's the weather', 'clear history'\n")
-        
-        try:
-            while True:
-                try:
-                    user_input = input("You: ").strip()
-                    
-                    if not user_input:
-                        continue
-                    
-                    if user_input.lower() in ['exit', 'quit', 'bye']:
-                        print("👋 Goodbye!")
-                        break
-                    
-                    response = self.ask(user_input)
-                    self.speak(response)
-                    print(f"({len(self.history)} in memory)\n")
-                    
-                except EOFError:
-                    break
-        except KeyboardInterrupt:
-            print("\n🛑 Shutting down...")
-    
-    def run_voice_mode(self):
-        """Voice interaction loop"""
-        threading.Thread(target=self.monitor_wake_word, daemon=True).start()
-        print("🎙️ Say 'Hey Arthur' to begin.\n")
-        
-        try:
-            while True:
-                try:
-                    self.wake_queue.get(timeout=0.1)
-                    
-                    # Clear queue
-                    while not self.wake_queue.empty():
-                        self.wake_queue.get_nowait()
-                    
-                    if self.speaking:
-                        self.interrupt.set()
-                        time.sleep(0.3)
-                    
-                    self.interrupt.clear()
-                    
-                    # Process
-                    audio = self.record()
-                    if audio:
-                        cmd = self.transcribe(audio)
-                        if cmd and len(cmd.strip()) > 2:
-                            print(f"🗣️ You: {cmd}")
-                            self.speak(self.ask(cmd))
-                            try:
-                                os.remove(audio)
-                            except:
-                                pass
-                        else:
-                            self.speak("I didn't catch that.")
-                    else:
-                        self.speak("Recording issue. Try again.")
-                    
-                    print(f"\n🎙️ Ready... ({len(self.history)} in memory)")
-                except queue.Empty:
-                    continue
-        except KeyboardInterrupt:
-            print("\n🛑 Shutting down...")
-    
-    def run(self):
-        """Main loop - chooses mode based on VOICE_MODE setting"""
-        try:
-            if self.voice_mode:
-                self.run_voice_mode()
-            else:
-                self.run_text_mode()
-        finally:
-            self.cleanup()
-    
-    def cleanup(self):
-        """Cleanup"""
-        if self.voice_mode and self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-        if self.pa:
-            self.pa.terminate()
-        if self.porcupine:
-            self.porcupine.delete()
-        print("👋 Goodbye!")
-
-# ════════════════════════════════════════════════════════════════════════════════════════════════════
-# 🚀 START
-# ════════════════════════════════════════════════════════════════════════════════════════════════════
-if __name__ == "__main__":
-    VoiceAssistant().run()
+            print(f"❌ Ollama error: {e}")
+            return "Something went wrong with Ollama. Is it running?"
