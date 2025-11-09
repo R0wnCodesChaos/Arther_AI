@@ -29,6 +29,8 @@ USER_INFO = """Name: Ronan
 Age: 13
 Location: Noels Pond, Newfoundland, Canada
 
+Current Date/Time: {current_time}
+
 Personality:
 Smart-ass, adventurous, sarcastic, and funny. Dark sense of humor, usually jokes around and doesn't take things too seriously. Likes when Arthur talks like a friend — casual, witty, and not robotic.
 
@@ -386,6 +388,17 @@ class VoiceAssistant:
         """Handle special commands (alarms, timers, weather)"""
         lower = text.lower()
         
+        # Time query
+        if any(phrase in lower for phrase in ['what time', 'current time', 'time is it', 'what\'s the time']):
+            current_time = datetime.now().strftime("%I:%M %p")
+            current_date = datetime.now().strftime("%A, %B %d, %Y")
+            return f"It's {current_time} on {current_date}"
+        
+        # Date query
+        if any(phrase in lower for phrase in ['what date', 'what day', 'today\'s date', 'what\'s the date']):
+            current_date = datetime.now().strftime("%A, %B %d, %Y")
+            return f"Today is {current_date}"
+        
         # Reset/Clear history
         if any(phrase in lower for phrase in ['reset history', 'clear history', 'forget everything', 'clear memory', 'reset memory']):
             count = len(self.history)
@@ -664,9 +677,11 @@ class VoiceAssistant:
     def ask_openai(self, prompt: str) -> str:
         """Get response from OpenAI"""
         try:
+            current_time = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
+            
             msgs = [{
                 "role": "system",
-                "content": f"You are Arthur, Ronan's AI. Be casual, witty, concise (1-2 sentences).\n\n{USER_INFO}"
+                "content": f"You are Arthur, Ronan's AI. Be casual, witty, concise (1-2 sentences).\n\n{USER_INFO.format(current_time=current_time)}"
             }]
             
             for entry in list(self.history)[-3:]:
@@ -702,7 +717,8 @@ class VoiceAssistant:
                 print(f"❌ OpenAI error: {response.status_code}")
                 # Fall back to Ollama if OpenAI fails
                 if self._check_ollama():
-                    print("   Falling back to Ollama...")
+                    self.speak("Falling back to Ollama")
+                    print("   ⚠️ Falling back to Ollama...")
                     self.use_openai = False
                     self.ai_mode = "Ollama (Fallback)"
                     return self.ask_ollama(prompt)
@@ -711,7 +727,8 @@ class VoiceAssistant:
             print(f"❌ OpenAI error: {e}")
             # Fall back to Ollama if OpenAI fails
             if self._check_ollama():
-                print("   Falling back to Ollama...")
+                self.speak("Falling back to Ollama")
+                print("   ⚠️ Falling back to Ollama...")
                 self.use_openai = False
                 self.ai_mode = "Ollama (Fallback)"
                 return self.ask_ollama(prompt)
@@ -720,9 +737,11 @@ class VoiceAssistant:
     def ask_ollama(self, prompt: str) -> str:
         """Get response from Ollama"""
         try:
+            current_time = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
+            
             msgs = [{
                 "role": "system",
-                "content": f"You are Arthur, Ronan's AI. Be casual, witty, concise (1-2 sentences).\n\n{USER_INFO}"
+                "content": f"You are Arthur, Ronan's AI. Be casual, witty, concise (1-2 sentences).\n\n{USER_INFO.format(current_time=current_time)}"
             }]
             
             for entry in list(self.history)[-3:]:
