@@ -18,12 +18,12 @@ OLLAMA_MODEL, MAX_TOKENS, TEMP = "llama3.2:3b", 150, 0.7
 VOICE_RATE = 180
 
 # OpenAI Configuration
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # Set your OpenAI API key as environment variable
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = "gpt-4o-mini"
 
 # Weather API (OpenWeatherMap - free tier)
-WEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")  # Get free key at openweathermap.org
-WEATHER_LOCATION = "Noels Pond,CA"  # Ronan's location
+WEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+WEATHER_LOCATION = "Noels Pond,CA"
 
 USER_INFO = """Name: Ronan
 Age: 13
@@ -82,8 +82,8 @@ class VoiceAssistant:
         self.ai_mode = "Checking..."
         
         # Alarms & Timers
-        self.alarms = []  # List of (datetime, label) tuples
-        self.timers = []  # List of (end_time, label) tuples
+        self.alarms = []
+        self.timers = []
         self.alarm_lock = threading.Lock()
         
         # Check AI availability
@@ -124,7 +124,6 @@ class VoiceAssistant:
     
     def _setup_ai(self):
         """Check internet and AI availability, prioritize OpenAI if available"""
-        # First check if OpenAI is available (requires API key and internet)
         if OPENAI_API_KEY:
             if self._check_openai():
                 self.use_openai = True
@@ -136,7 +135,6 @@ class VoiceAssistant:
         else:
             print("⚠️ OpenAI: API key not set")
         
-        # Fall back to Ollama
         if self._check_ollama():
             self.use_openai = False
             self.ai_mode = "Ollama (Offline)"
@@ -150,18 +148,15 @@ class VoiceAssistant:
     def _check_openai(self) -> bool:
         """Check if OpenAI API is accessible"""
         try:
-            # First do a quick internet check
             test_response = requests.get("https://www.google.com", timeout=3)
             if test_response.status_code != 200:
                 return False
             
-            # Then check OpenAI API
             headers = {
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
                 "Content-Type": "application/json"
             }
             
-            # Use a simpler endpoint that's faster
             data = {
                 "model": OPENAI_MODEL,
                 "messages": [{"role": "user", "content": "test"}],
@@ -175,16 +170,8 @@ class VoiceAssistant:
                 timeout=10
             )
             
-            # Accept both 200 (success) and 401 (invalid key but API is reachable)
             return response.status_code in [200, 401]
-        except requests.exceptions.Timeout:
-            print("   (Timeout checking OpenAI API)")
-            return False
-        except requests.exceptions.ConnectionError:
-            print("   (No internet connection)")
-            return False
-        except Exception as e:
-            print(f"   (Error: {e})")
+        except:
             return False
     
     def _check_ollama(self) -> bool:
@@ -224,7 +211,6 @@ class VoiceAssistant:
                 now = datetime.now()
                 
                 with self.alarm_lock:
-                    # Check alarms
                     triggered_alarms = []
                     for alarm_time, label in self.alarms:
                         if now >= alarm_time:
@@ -237,7 +223,6 @@ class VoiceAssistant:
                         self.play_alarm_sound()
                         self.speak(msg)
                     
-                    # Check timers
                     triggered_timers = []
                     for end_time, label in self.timers:
                         if now >= end_time:
@@ -250,7 +235,7 @@ class VoiceAssistant:
                         self.play_alarm_sound()
                         self.speak(msg)
                 
-                time.sleep(1)  # Check every second
+                time.sleep(1)
             except Exception as e:
                 print(f"⚠️ Alarm monitor error: {e}")
                 time.sleep(1)
@@ -268,17 +253,15 @@ class VoiceAssistant:
             'a': '1', 'an': '1'
         }
         
-        # Replace word numbers with digits
         for word, num in word_to_num.items():
             text = re.sub(r'\b' + word + r'\b', num, text)
         
         return text
     
     def parse_time(self, text: str) -> Optional[datetime]:
-        """Parse time expressions like '7:30 AM', 'fifteen forty-five', '7 PM'"""
+        """Parse time expressions"""
         text = self.word_to_number(text.strip()).upper()
         
-        # Try HH:MM AM/PM format
         match = re.search(r'(\d{1,2}):(\d{2})\s*(AM|PM)', text)
         if match:
             hour, minute, period = match.groups()
@@ -295,7 +278,6 @@ class VoiceAssistant:
                 target += timedelta(days=1)
             return target
         
-        # Try HH AM/PM format
         match = re.search(r'(\d{1,2})\s*(AM|PM)', text)
         if match:
             hour, period = match.groups()
@@ -311,7 +293,6 @@ class VoiceAssistant:
                 target += timedelta(days=1)
             return target
         
-        # Try 24-hour format HH:MM
         match = re.search(r'(\d{1,2}):(\d{2})', text)
         if match:
             hour, minute = match.groups()
@@ -326,21 +307,18 @@ class VoiceAssistant:
         return None
     
     def parse_duration(self, text: str) -> Optional[int]:
-        """Parse duration in seconds from text like '5 minutes', 'two hours', '30 seconds'"""
+        """Parse duration in seconds"""
         text = self.word_to_number(text.lower())
         total_seconds = 0
         
-        # Hours
         match = re.search(r'(\d+)\s*(?:hour|hr)s?', text)
         if match:
             total_seconds += int(match.group(1)) * 3600
         
-        # Minutes
         match = re.search(r'(\d+)\s*(?:minute|min)s?', text)
         if match:
             total_seconds += int(match.group(1)) * 60
         
-        # Seconds
         match = re.search(r'(\d+)\s*(?:second|sec)s?', text)
         if match:
             total_seconds += int(match.group(1))
@@ -348,16 +326,13 @@ class VoiceAssistant:
         return total_seconds if total_seconds > 0 else None
     
     def play_alarm_sound(self):
-        """Play alarm sound using system beep"""
+        """Play alarm sound"""
         try:
-            # Try to use winsound on Windows
             import winsound
-            # Play 3 beeps
             for _ in range(3):
-                winsound.Beep(1000, 500)  # 1000 Hz for 500ms
+                winsound.Beep(1000, 500)
                 time.sleep(0.2)
         except:
-            # Fallback: print bell character (works on most terminals)
             for _ in range(3):
                 print('\a', end='', flush=True)
                 time.sleep(0.5)
@@ -385,19 +360,8 @@ class VoiceAssistant:
             return f"Weather check failed: {str(e)}"
     
     def handle_command(self, text: str) -> Optional[str]:
-        """Handle special commands (alarms, timers, weather)"""
+        """Handle special commands - REMOVED time/date queries to let AI handle them naturally"""
         lower = text.lower()
-        
-        # Time query
-        if any(phrase in lower for phrase in ['what time', 'current time', 'time is it', 'what\'s the time']):
-            current_time = datetime.now().strftime("%I:%M %p")
-            current_date = datetime.now().strftime("%A, %B %d, %Y")
-            return f"It's {current_time} on {current_date}"
-        
-        # Date query
-        if any(phrase in lower for phrase in ['what date', 'what day', 'today\'s date', 'what\'s the date']):
-            current_date = datetime.now().strftime("%A, %B %d, %Y")
-            return f"Today is {current_date}"
         
         # Reset/Clear history
         if any(phrase in lower for phrase in ['reset history', 'clear history', 'forget everything', 'clear memory', 'reset memory']):
@@ -418,7 +382,6 @@ class VoiceAssistant:
                     parts = lower.split('for', 1)
                     if len(parts) > 1:
                         label_part = parts[1].strip().replace('alarm', '').strip()
-                        # Remove time-related words and number words
                         time_words = ['am', 'pm', 'o\'clock', 'oclock']
                         number_words = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
                                       'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 
@@ -427,7 +390,6 @@ class VoiceAssistant:
                                       'twenty-six', 'twenty-seven', 'twenty-eight', 'twenty-nine', 'a', 'an']
                         for word in time_words + number_words:
                             label_part = re.sub(r'\b' + word + r'\b', '', label_part, flags=re.IGNORECASE)
-                        # Remove digits and colons
                         label_part = re.sub(r'[\d:]+', '', label_part)
                         label = label_part.strip().strip(',').strip()
                 
@@ -459,11 +421,9 @@ class VoiceAssistant:
         
         # Clear alarms
         if 'alarm' in lower and ('clear' in lower or 'delete' in lower or 'remove' in lower or 'cancel' in lower):
-            # Check if user wants to clear a specific alarm
             alarm_time = self.parse_time(text)
             if alarm_time and 'all' not in lower:
                 with self.alarm_lock:
-                    # Find and remove alarm matching the time
                     for i, (atime, label) in enumerate(self.alarms):
                         if atime.hour == alarm_time.hour and atime.minute == alarm_time.minute:
                             self.alarms.pop(i)
@@ -471,7 +431,6 @@ class VoiceAssistant:
                             return f"Cancelled alarm at {time_str}"
                     return "No alarm found at that time"
             
-            # Clear all alarms
             with self.alarm_lock:
                 count = len(self.alarms)
                 self.alarms.clear()
@@ -483,23 +442,17 @@ class VoiceAssistant:
             if duration:
                 label = ""
                 if 'for' in lower:
-                    # Extract label after 'for'
                     parts = text.lower().split('for')
                     if len(parts) > 1:
-                        # Remove time-related words to get label
                         label_part = parts[-1]
-                        # Remove time words
                         time_words = ['minutes', 'minute', 'min', 'hours', 'hour', 'hr', 'seconds', 'second', 'sec', 'timer']
-                        # Remove number words
                         number_words = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
                                       'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 
                                       'eighteen', 'nineteen', 'twenty', 'thirty', 'forty', 'fifty', 'sixty',
                                       'twenty-one', 'twenty-two', 'twenty-three', 'twenty-four', 'twenty-five',
                                       'twenty-six', 'twenty-seven', 'twenty-eight', 'twenty-nine', 'a', 'an']
-                        # Remove all time and number words
                         for word in time_words + number_words:
                             label_part = re.sub(r'\b' + word + r'\b', '', label_part, flags=re.IGNORECASE)
-                        # Also remove digits
                         label_part = re.sub(r'\b\d+\b', '', label_part)
                         label = label_part.strip().strip(',').strip()
                 
@@ -508,7 +461,6 @@ class VoiceAssistant:
                 with self.alarm_lock:
                     self.timers.append((end_time, label))
                 
-                # Format duration nicely
                 hours = duration // 3600
                 minutes = (duration % 3600) // 60
                 seconds = duration % 60
@@ -551,23 +503,20 @@ class VoiceAssistant:
         
         # Clear timers
         if 'timer' in lower and ('clear' in lower or 'delete' in lower or 'remove' in lower or 'cancel' in lower or 'stop' in lower):
-            # Check if user specified a number (e.g., "cancel timer 1" or "stop the first timer")
             match = re.search(r'(?:timer\s*)?(?:number\s*)?(\d+|first|second|third|last)', lower)
             if match and 'all' not in lower:
                 position_str = match.group(1)
                 
-                # Convert position to index
                 position_map = {'first': 0, 'second': 1, 'third': 2, 'last': -1}
                 if position_str in position_map:
                     index = position_map[position_str]
                 else:
-                    index = int(position_str) - 1  # Convert to 0-based index
+                    index = int(position_str) - 1
                 
                 with self.alarm_lock:
                     if not self.timers:
                         return "No timers to cancel"
                     
-                    # Sort timers by end time for consistent ordering
                     sorted_timers = sorted(self.timers)
                     
                     if index < 0:
@@ -587,7 +536,6 @@ class VoiceAssistant:
                     else:
                         return f"Timer number {index + 1} doesn't exist"
             
-            # Clear all timers
             with self.alarm_lock:
                 count = len(self.timers)
                 self.timers.clear()
@@ -609,7 +557,6 @@ class VoiceAssistant:
                 input=True, frames_per_buffer=CHUNK, input_device_index=MIC_INDEX
             )
             
-            # Clear buffer
             for _ in range(5):
                 rec_stream.read(CHUNK, exception_on_overflow=False)
             time.sleep(0.2)
@@ -715,9 +662,7 @@ class VoiceAssistant:
                 return reply
             else:
                 print(f"❌ OpenAI error: {response.status_code}")
-                # Fall back to Ollama if OpenAI fails
                 if self._check_ollama():
-                    self.speak("Falling back to Ollama")
                     print("   ⚠️ Falling back to Ollama...")
                     self.use_openai = False
                     self.ai_mode = "Ollama (Fallback)"
@@ -725,9 +670,7 @@ class VoiceAssistant:
                 return "OpenAI request failed. Check your connection or API key."
         except Exception as e:
             print(f"❌ OpenAI error: {e}")
-            # Fall back to Ollama if OpenAI fails
             if self._check_ollama():
-                self.speak("Falling back to Ollama")
                 print("   ⚠️ Falling back to Ollama...")
                 self.use_openai = False
                 self.ai_mode = "Ollama (Fallback)"
@@ -765,28 +708,25 @@ class VoiceAssistant:
     
     def ask(self, prompt: str) -> str:
         """Get AI response"""
-        # Check for special commands first
         command_response = self.handle_command(prompt)
         if command_response:
             return command_response
         
         p = prompt.lower().replace('.', '').replace(',', '')
         
-        # Custom responses
         for trigger, resp in CUSTOM_RESPONSES.items():
             if trigger in p:
                 return resp
         
         print(f"🤔 Thinking... ({self.ai_mode})")
         
-        # Route to appropriate AI
         if self.use_openai:
             return self.ask_openai(prompt)
         else:
             return self.ask_ollama(prompt)
     
     def speak(self, text: str):
-        """Text to speech - Fixed for Windows"""
+        """Text to speech"""
         print(f"💬 Arthur: {text}")
         
         if not self.voice_mode:
@@ -796,7 +736,6 @@ class VoiceAssistant:
         self.interrupt.clear()
         
         try:
-            # Create fresh TTS engine to avoid state issues on Windows
             engine = pyttsx3.init()
             engine.setProperty('rate', VOICE_RATE)
             engine.setProperty('volume', 1.0)
@@ -805,18 +744,15 @@ class VoiceAssistant:
             if voices:
                 engine.setProperty('voice', voices[0].id)
             
-            # Check for interrupt
             if self.interrupt.is_set():
                 print("   ⚠️ Interrupted!")
                 engine.stop()
                 del engine
                 return
             
-            # Speak the full text
             engine.say(text)
             engine.runAndWait()
             
-            # Clean up engine
             del engine
             
         except Exception as e:
@@ -860,7 +796,6 @@ class VoiceAssistant:
                 try:
                     self.wake_queue.get(timeout=0.1)
                     
-                    # Clear queue
                     while not self.wake_queue.empty():
                         self.wake_queue.get_nowait()
                     
@@ -870,7 +805,6 @@ class VoiceAssistant:
                     
                     self.interrupt.clear()
                     
-                    # Process
                     audio = self.record()
                     if audio:
                         cmd = self.transcribe(audio)
@@ -893,7 +827,7 @@ class VoiceAssistant:
             print("\n🛑 Shutting down...")
     
     def run(self):
-        """Main loop - chooses mode based on VOICE_MODE setting"""
+        """Main loop"""
         try:
             if self.voice_mode:
                 self.run_voice_mode()
