@@ -338,7 +338,7 @@ class VoiceAssistant:
                 time.sleep(0.5)
     
     def get_weather(self) -> str:
-        """Get weather information"""
+        """Get current weather information"""
         if not WEATHER_API_KEY:
             return "Weather API key not set. Get a free key at openweathermap.org and set OPENWEATHER_API_KEY environment variable."
         
@@ -359,6 +359,87 @@ class VoiceAssistant:
         except Exception as e:
             return f"Weather check failed: {str(e)}"
     
+    def get_forecast(self) -> str:
+        """Get weekend/multi-day weather forecast"""
+        if not WEATHER_API_KEY:
+            return "Weather API key not set."
+        
+        try:
+            url = f"http://api.openweathermap.org/data/2.5/forecast?q={WEATHER_LOCATION}&appid={WEATHER_API_KEY}&units=metric"
+            response = requests.get(url, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Get today's day number (0=Monday, 6=Sunday)
+                today = datetime.now().weekday()
+                
+                # Calculate days until Saturday (5) and Sunday (6)
+                days_to_saturday = (5 - today) % 7
+                days_to_sunday = (6 - today) % 7
+                
+                # If it's already Saturday or Sunday, use today/tomorrow
+                if today == 5:  # Saturday
+                    days_to_saturday = 0
+                    days_to_sunday = 1
+                elif today == 6:  # Sunday
+                    days_to_saturday = 6
+                    days_to_sunday = 0
+                
+                saturday = datetime.now() + timedelta(days=days_to_saturday)
+                sunday = datetime.now() + timedelta(days=days_to_sunday)
+                
+                # Find forecasts for Saturday and Sunday (around noon)
+                saturday_data = None
+                sunday_data = None
+                
+                for forecast in data['list']:
+                    forecast_time = datetime.fromtimestamp(forecast['dt'])
+                    
+                    # Look for forecast around noon (12:00)
+                    if forecast_time.date() == saturday.date() and 10 <= forecast_time.hour <= 14:
+                        if not saturday_data:
+                            saturday_data = forecast
+                        else:
+                            # Pick the one closest to noon
+                            current_diff = abs(forecast_time.hour - 12)
+                            prev_time = datetime.fromtimestamp(saturday_data['dt'])
+                            prev_diff = abs(prev_time.hour - 12)
+                            if current_diff < prev_diff:
+                                saturday_data = forecast
+                    
+                    if forecast_time.date() == sunday.date() and 10 <= forecast_time.hour <= 14:
+                        if not sunday_data:
+                            sunday_data = forecast
+                        else:
+                            # Pick the one closest to noon
+                            current_diff = abs(forecast_time.hour - 12)
+                            prev_time = datetime.fromtimestamp(sunday_data['dt'])
+                            prev_diff = abs(prev_time.hour - 12)
+                            if current_diff < prev_diff:
+                                sunday_data = forecast
+                
+                result = "Weekend forecast for Noels Pond: "
+                
+                if saturday_data:
+                    sat_temp = saturday_data['main']['temp']
+                    sat_desc = saturday_data['weather'][0]['description']
+                    result += f"Saturday: {sat_temp:.0f}°C, {sat_desc}. "
+                
+                if sunday_data:
+                    sun_temp = sunday_data['main']['temp']
+                    sun_desc = sunday_data['weather'][0]['description']
+                    result += f"Sunday: {sun_temp:.0f}°C, {sun_desc}."
+                
+                if not saturday_data and not sunday_data:
+                    return "Weekend forecast not available yet (only shows next 5 days)."
+                
+                return result.strip()
+            else:
+                return "Couldn't fetch forecast. Check your API key or internet connection."
+        except Exception as e:
+            return f"Forecast check failed: {str(e)}"
+    
     def handle_command(self, text: str) -> Optional[str]:
         """Handle special commands - REMOVED time/date queries to let AI handle them naturally"""
         lower = text.lower()
@@ -369,9 +450,8 @@ class VoiceAssistant:
             self.history.clear()
             return f"Memory cleared! Forgot {count} conversation(s)." if count > 0 else "Memory was already empty."
         
-        # Weather
-        if any(word in lower for word in ['weather', 'temperature', 'forecast', 'outside']):
-            return self.get_weather()
+        # Weather/Forecast - Don't return directly, return None to let AI handle it
+        # The data will be injected into the prompt instead
         
         # Set alarm
         if 'alarm' in lower and ('set' in lower or 'create' in lower or 'for' in lower or 'at' in lower):
@@ -626,9 +706,22 @@ class VoiceAssistant:
         try:
             current_time = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
             
+            # Check if user is asking about weather and inject data
+            weather_data = ""
+            lower_prompt = prompt.lower()
+            
+            if any(word in lower_prompt for word in ['weekend', 'forecast', 'saturday', 'sunday', 'this week', 'next week']):
+                forecast = self.get_forecast()
+                if forecast and not forecast.startswith("Forecast check failed"):
+                    weather_data = f"\n\nCurrent Weather Forecast:\n{forecast}"
+            elif any(word in lower_prompt for word in ['weather', 'temperature', 'outside', 'hot', 'cold', 'rain', 'snow']):
+                weather = self.get_weather()
+                if weather and not weather.startswith("Weather check failed"):
+                    weather_data = f"\n\nCurrent Weather:\n{weather}"
+            
             msgs = [{
                 "role": "system",
-                "content": f"You are Arthur, Ronan's AI. Be casual, witty, concise (1-2 sentences).\n\n{USER_INFO.format(current_time=current_time)}"
+                "content": f"You are Arthur, Ronan's AI. Be casual, witty, concise (1-2 sentences).\n\n{USER_INFO.format(current_time=current_time)}{weather_data}"
             }]
             
             for entry in list(self.history)[-3:]:
@@ -682,9 +775,22 @@ class VoiceAssistant:
         try:
             current_time = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
             
+            # Check if user is asking about weather and inject data
+            weather_data = ""
+            lower_prompt = prompt.lower()
+            
+            if any(word in lower_prompt for word in ['weekend', 'forecast', 'saturday', 'sunday', 'this week', 'next week']):
+                forecast = self.get_forecast()
+                if forecast and not forecast.startswith("Forecast check failed"):
+                    weather_data = f"\n\nCurrent Weather Forecast:\n{forecast}"
+            elif any(word in lower_prompt for word in ['weather', 'temperature', 'outside', 'hot', 'cold', 'rain', 'snow']):
+                weather = self.get_weather()
+                if weather and not weather.startswith("Weather check failed"):
+                    weather_data = f"\n\nCurrent Weather:\n{weather}"
+            
             msgs = [{
                 "role": "system",
-                "content": f"You are Arthur, Ronan's AI. Be casual, witty, concise (1-2 sentences).\n\n{USER_INFO.format(current_time=current_time)}"
+                "content": f"You are Arthur, Ronan's AI. Be casual, witty, concise (1-2 sentences).\n\n{USER_INFO.format(current_time=current_time)}{weather_data}"
             }]
             
             for entry in list(self.history)[-3:]:
@@ -726,7 +832,7 @@ class VoiceAssistant:
             return self.ask_ollama(prompt)
     
     def speak(self, text: str):
-        """Text to speech"""
+        """Text to speech with immediate interrupt capability"""
         print(f"💬 Arthur: {text}")
         
         if not self.voice_mode:
@@ -744,14 +850,18 @@ class VoiceAssistant:
             if voices:
                 engine.setProperty('voice', voices[0].id)
             
-            if self.interrupt.is_set():
-                print("   ⚠️ Interrupted!")
-                engine.stop()
-                del engine
-                return
+            # Split text into sentences for interruptible speech
+            sentences = text.replace('!', '.').replace('?', '.').split('.')
+            sentences = [s.strip() for s in sentences if s.strip()]
             
-            engine.say(text)
-            engine.runAndWait()
+            for sentence in sentences:
+                if self.interrupt.is_set():
+                    print("   ⚠️ Interrupted!")
+                    engine.stop()
+                    break
+                
+                engine.say(sentence)
+                engine.runAndWait()
             
             del engine
             
@@ -796,15 +906,19 @@ class VoiceAssistant:
                 try:
                     self.wake_queue.get(timeout=0.1)
                     
+                    # Clear queue
                     while not self.wake_queue.empty():
                         self.wake_queue.get_nowait()
                     
+                    # If speaking, interrupt immediately and start listening
                     if self.speaking:
                         self.interrupt.set()
-                        time.sleep(0.3)
+                        print("\n⚠️ INTERRUPT! Starting new command...")
+                        time.sleep(0.1)  # Brief pause to stop speech
                     
                     self.interrupt.clear()
                     
+                    # Start recording immediately after wake word
                     audio = self.record()
                     if audio:
                         cmd = self.transcribe(audio)
